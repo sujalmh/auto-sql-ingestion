@@ -1,0 +1,57 @@
+# Metadata insertion helper code
+# Add this code after line 407 in main.py (after rows_inserted = db_manager.insert_data...)
+
+        # Step 4: Insert metadata into tables_metadata
+        logger.info(f"[Job {job_id}] Inserting metadata into tables_metadata")
+        llm_meta = job.llm_metadata or {}
+        period_col = llm_meta.get('period_column')
+        
+        min_period_sql, max_period_sql = None, None
+        if period_col:
+            min_period_sql, max_period_sql = metadata_generator.generate_period_sql(table_name, period_col)
+        
+        tables_metadata_dict = {
+            'data_domain': llm_meta.get('data_domain'),
+            'table_name': table_name,
+            'columns': ', '.join(job.processed_df.columns.tolist()),
+            'comments': llm_meta.get('description'),
+            'source': user_metadata.source,
+            'source_url': user_metadata.source_url,
+            'released_on': user_metadata.released_on,
+            'updated_on': user_metadata.updated_on,
+            'rows_count': rows_inserted,
+            'business_metadata': user_metadata.business_metadata,
+            'table_view': 'table',
+            'period_cols': period_col,
+            'min_period_sql': min_period_sql,
+            'max_period_sql': max_period_sql
+        }
+        
+        db_manager.insert_tables_metadata(tables_metadata_dict)
+        logger.info(f"[Job {job_id}] tables_metadata record inserted")
+        
+        # Step 5: Insert metadata into operational_metadata
+        logger.info(f"[Job {job_id}] Inserting metadata into operational_metadata")
+        
+        first_val, last_val = None, None
+        if period_col:
+            first_val, last_val = metadata_generator.get_period_values(job.processed_df, period_col)
+        
+        operational_metadata_dict = {
+            'table_name': table_name,
+            'table_view': 'Table',
+            'period_cols': period_col,
+            'first_available_value': first_val,
+            'last_available_value': last_val,
+            'last_updated_on': datetime.now(),
+            'rows_count': rows_inserted,
+            'columns': ', '.join(job.processed_df.columns.tolist()),
+            'source_url': user_metadata.source_url,
+            'business_metadata': user_metadata.business_metadata,
+            'major_domain': llm_meta.get('major_domain'),
+            'sub_domain': llm_meta.get('sub_domain'),
+            'brief_summary': llm_meta.get('description')
+        }
+        
+        db_manager.insert_operational_metadata(operational_metadata_dict)
+        logger.info(f"[Job {job_id}] operational_metadata record inserted")

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL Ingestion Pipeline</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 AI-Driven SQL Ingestion Pipeline</h1>
+            <p>Upload your Excel/CSV files and let AI handle the rest</p>
+        </header>
+
+        <!-- Upload Section -->
+        <section id="upload-section" class="card">
+            <h2>Upload File</h2>
+            <div class="upload-area" id="upload-area">
+                <div class="upload-icon">📁</div>
+                <p>Drag & drop your file here or click to browse</p>
+                <p class="file-types">Supports: .xlsx, .csv</p>
+                <input type="file" id="file-input" accept=".xlsx,.csv" hidden>
+            </div>
+
+            <div class="form-group">
+                <label for="file-description">File Description (Optional)</label>
+                <input type="text" id="file-description" placeholder="e.g., Monthly GDP data, Trade statistics">
+                <small>Helps generate better table names</small>
+            </div>
+
+            <button id="upload-btn" class="btn btn-primary" disabled>Upload & Process</button>
+        </section>
+
+        <!-- Processing Section -->
+        <section id="processing-section" class="card" style="display: none;">
+            <h2>Processing...</h2>
+            <div class="progress-container">
+                <div class="progress-step" data-step="upload">
+                    <div class="step-icon">📤</div>
+                    <div class="step-info">
+                        <h3>Uploading</h3>
+                        <p class="step-status">Waiting...</p>
+                    </div>
+                </div>
+                <div class="progress-step" data-step="preprocessing">
+                    <div class="step-icon">⚙️</div>
+                    <div class="step-info">
+                        <h3>Preprocessing</h3>
+                        <p class="step-status">Waiting...</p>
+                    </div>
+                </div>
+                <div class="progress-step" data-step="similarity_search">
+                    <div class="step-icon">🔍</div>
+                    <div class="step-info">
+                        <h3>Similarity Search</h3>
+                        <p class="step-status">Waiting...</p>
+                    </div>
+                </div>
+                <div class="progress-step" data-step="awaiting_approval">
+                    <div class="step-icon">👀</div>
+                    <div class="step-info">
+                        <h3>Ready for Review</h3>
+                        <p class="step-status">Waiting...</p>
+                    </div>
+                </div>
+                <div class="progress-step" data-step="approved">
+                    <div class="step-icon">✅</div>
+                    <div class="step-info">
+                        <h3>Inserting to Database</h3>
+                        <p class="step-status">Waiting...</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Preview Section (OTL) -->
+        <section id="preview-section" class="card" style="display: none;">
+            <div class="load-type-badge" id="load-type-badge">
+                <span class="badge badge-otl">🆕 One-Time Load (OTL)</span>
+            </div>
+            <h2>Preview & Approve</h2>
+
+            <div class="preview-info">
+                <div class="info-group table-name-group">
+                    <label for="table-name-input">Table Name (Editable):</label>
+                    <input type="text" id="table-name-input" class="table-name-input" placeholder="Enter table name">
+                    <small>You can modify the AI-generated table name</small>
+                </div>
+                <div class="info-group">
+                    <label>Total Rows:</label>
+                    <span id="preview-rows" class="value"></span>
+                </div>
+                <div class="info-group">
+                    <label>Columns:</label>
+                    <span id="preview-columns" class="value"></span>
+                </div>
+            </div>
+
+            <div class="llm-metadata">
+                <h3>AI-Generated Insights</h3>
+                <div id="llm-metadata-content"></div>
+            </div>
+
+            <div class="data-preview">
+                <h3>Sample Data</h3>
+                <div id="preview-table-container"></div>
+            </div>
+
+            <div class="metadata-form">
+                <h3>Required Metadata</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="source">Data Source *</label>
+                        <input type="text" id="source" placeholder="e.g., RBI, Ministry of Commerce" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="source-url">Source URL *</label>
+                        <input type="url" id="source-url" placeholder="https://..." required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="released-on">Released On *</label>
+                        <input type="date" id="released-on" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="updated-on">Updated On *</label>
+                        <input type="date" id="updated-on" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="business-metadata">Business Context (Optional)</label>
+                    <textarea id="business-metadata" rows="3"
+                        placeholder="Additional context about this data..."></textarea>
+                </div>
+            </div>
+
+            <div class="action-buttons">
+                <button id="approve-btn" class="btn btn-success">✓ Approve & Insert</button>
+                <button id="reject-btn" class="btn btn-danger">✗ Reject</button>
+            </div>
+        </section>
+
+        <!-- Incremental Load Preview Section -->
+        <section id="il-preview-section" class="card" style="display: none;">
+            <div class="load-type-badge">
+                <span class="badge badge-il">🔄 Incremental Load (IL)</span>
+            </div>
+            <h2>Incremental Load Preview</h2>
+
+            <!-- Duplicate Detection Warning -->
+            <div id="duplicate-warning" class="warning-box" style="display: none;">
+                <div class="warning-icon">⚠️</div>
+                <div class="warning-content">
+                    <h3>Duplicate Data Detected</h3>
+                    <p id="duplicate-message"></p>
+                    <div class="period-comparison">
+                        <div class="period-item">
+                            <strong>Existing Data:</strong>
+                            <span id="existing-period"></span>
+                        </div>
+                        <div class="period-item">
+                            <strong>New Data:</strong>
+                            <span id="new-period"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Similar Table Match -->
+            <div class="il-match-info">
+                <h3>📊 Matched Table</h3>
+                <div class="match-details">
+                    <div class="info-group">
+                        <label>Table Name:</label>
+                        <span id="il-table-name" class="value"></span>
+                    </div>
+                    <div class="info-group">
+                        <label>Similarity Score:</label>
+                        <span id="il-similarity" class="value"></span>
+                    </div>
+                    <div class="info-group">
+                        <label>Current Rows:</label>
+                        <span id="il-current-rows" class="value"></span>
+                    </div>
+                    <div class="info-group">
+                        <label>New Rows to Add:</label>
+                        <span id="il-new-rows" class="value"></span>
+                    </div>
+                    <div class="info-group">
+                        <label>Total After Load:</label>
+                        <span id="il-total-rows" class="value"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Schema Validation Report -->
+            <div class="schema-validation">
+                <h3>🔍 Schema Validation</h3>
+                <div class="validation-status" id="validation-status"></div>
+                <div class="validation-details">
+                    <div class="validation-section" id="matching-columns-section" style="display: none;">
+                        <h4>✓ Matching Columns (<span id="matching-count"></span>)</h4>
+                        <div id="matching-columns" class="column-list"></div>
+                    </div>
+                    <div class="validation-section" id="missing-columns-section" style="display: none;">
+                        <h4>⚠️ Missing Columns (<span id="missing-count"></span>)</h4>
+                        <p class="help-text">These columns exist in the table but not in your file (will be NULL)</p>
+                        <div id="missing-columns" class="column-list"></div>
+                    </div>
+                    <div class="validation-section" id="extra-columns-section" style="display: none;">
+                        <h4>➕ Extra Columns (<span id="extra-count"></span>)</h4>
+                        <p class="help-text">These columns exist in your file but not in the table (will be ignored)</p>
+                        <div id="extra-columns" class="column-list"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sample Data Preview -->
+            <div class="data-preview">
+                <h3>Sample Data to be Added</h3>
+                <div id="il-preview-table-container"></div>
+            </div>
+
+            <!-- Metadata Form (same as OTL) -->
+            <div class="metadata-form">
+                <h3>Required Metadata</h3>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="il-source">Data Source *</label>
+                        <input type="text" id="il-source" placeholder="e.g., RBI, Ministry of Commerce" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="il-source-url">Source URL *</label>
+                        <input type="url" id="il-source-url" placeholder="https://..." required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="il-released-on">Released On *</label>
+                        <input type="date" id="il-released-on" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="il-updated-on">Updated On *</label>
+                        <input type="date" id="il-updated-on" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="il-business-metadata">Business Context (Optional)</label>
+                    <textarea id="il-business-metadata" rows="3"
+                        placeholder="Additional context about this data..."></textarea>
+                </div>
+            </div>
+
+            <div class="action-buttons">
+                <button id="il-approve-btn" class="btn btn-success">✓ Approve & Append Data</button>
+                <button id="il-reject-btn" class="btn btn-danger">✗ Reject</button>
+            </div>
+        </section>
+
+        <!-- Success Section -->
+        <section id="success-section" class="card" style="display: none;">
+            <div class="success-icon">🎉</div>
+            <h2>Successfully Completed!</h2>
+            <div class="success-info">
+                <div class="load-type-result" id="success-load-type"></div>
+                <p><strong>Table:</strong> <span id="success-table-name"></span></p>
+                <p><strong>Rows <span id="success-action">Inserted</span>:</strong> <span id="success-rows"></span></p>
+            </div>
+            <button id="new-upload-btn" class="btn btn-primary">Upload Another File</button>
+        </section>
+
+        <!-- Error Section -->
+        <section id="error-section" class="card error-card" style="display: none;">
+            <div class="error-icon">⚠️</div>
+            <h2>Error</h2>
+            <p id="error-message"></p>
+            <button id="retry-btn" class="btn btn-primary">Try Again</button>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
