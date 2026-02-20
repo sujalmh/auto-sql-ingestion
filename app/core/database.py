@@ -1,3 +1,4 @@
+import re
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import execute_batch
@@ -114,6 +115,8 @@ class DatabaseManager:
             logger.error(f"Error creating table '{table_name}': {str(e)}")
             return False
     
+    _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
     def _normalize_date_columns(self, df: pd.DataFrame, column_types: Dict[str, str]) -> pd.DataFrame:
         """
         Parse ambiguous date strings (e.g. DD-MM-YY) into ISO 8601 (YYYY-MM-DD)
@@ -126,7 +129,14 @@ class DatabaseManager:
             if not any(kw in col_type.upper() for kw in date_type_keywords):
                 continue
             try:
-                parsed = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+                non_null = df[col].dropna()
+                first_valid = str(non_null.astype(str).iloc[0]) if len(non_null) > 0 else ""
+                already_iso = bool(self._ISO_DATE_RE.match(str(first_valid)))
+                parsed = pd.to_datetime(
+                    df[col],
+                    dayfirst=not already_iso,
+                    errors='coerce',
+                )
                 non_null_ratio = parsed.notna().sum() / max(len(parsed), 1)
                 if non_null_ratio >= 0.5:
                     df[col] = parsed.dt.strftime('%Y-%m-%d').where(parsed.notna(), other=None)
@@ -136,6 +146,32 @@ class DatabaseManager:
             except Exception as e:
                 logger.warning(f"Could not normalize date column '{col}': {e}")
         return df
+
+    def _widen_narrow_varchars(self, table_name: str, df: pd.DataFrame, column_types: Dict[str, str]) -> None:
+        """
+        Before insertion, check every VARCHAR(n) column: if the data contains values
+        longer than n, ALTER the column to TEXT so the INSERT won't fail.
+        """
+        varchar_re = re.compile(r"VARCHAR\((\d+)\)", re.IGNORECASE)
+        alterations: List[str] = []
+        for col, col_type in column_types.items():
+            m = varchar_re.search(col_type)
+            if not m or col not in df.columns:
+                continue
+            limit = int(m.group(1))
+            max_len = df[col].dropna().astype(str).str.len().max()
+            if pd.isna(max_len):
+                continue
+            if int(max_len) > limit:
+                safe_col = self._sanitize_identifier(col)
+                alterations.append(safe_col)
+                logger.warning(f"Column '{col}' max length {int(max_len)} exceeds VARCHAR({limit}); widening to TEXT")
+        if alterations:
+            safe_table = self._sanitize_identifier(table_name)
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    for safe_col in alterations:
+                        cur.execute(f"ALTER TABLE {safe_table} ALTER COLUMN {safe_col} TYPE TEXT")
 
     def insert_data(
         self,
@@ -161,6 +197,7 @@ class DatabaseManager:
         try:
             if column_types:
                 df = self._normalize_date_columns(df.copy(), column_types)
+                self._widen_narrow_varchars(table_name, df, column_types)
 
             # Prepare column names and data
             columns = df.columns.tolist()
