@@ -39,6 +39,7 @@ class JobData:
         self.column_types: Optional[Dict[str, str]] = None
         self.preprocessing_summary: Optional[str] = None
         self.llm_metadata: Optional[Dict] = None  # Store LLM-generated metadata
+        self.data_category: Optional[int] = None  # 1 = standard, 2 = hierarchical/row-structure
         
         # Incremental Load fields
         self.similar_tables: Optional[List[Dict]] = None  # Similarity search results
@@ -115,7 +116,15 @@ class JobManager:
         """
         with self._lock:
             return self._jobs.get(job_id)
-    
+
+    def clear_all(self) -> int:
+        """Clear all jobs from memory. Returns number of jobs cleared."""
+        with self._lock:
+            n = len(self._jobs)
+            self._jobs.clear()
+        logger.info(f"Cleared {n} job(s) from memory")
+        return n
+
     def update_status(
         self,
         job_id: str,
@@ -187,6 +196,7 @@ class JobManager:
                 job.column_types = column_types
                 job.preprocessing_summary = summary
                 job.llm_metadata = llm_metadata
+                job.data_category = llm_metadata.get("data_category") if llm_metadata else None
                 job.updated_at = datetime.now()
                 logger.info(f"Job {job_id} preprocessing results stored")
                 return True

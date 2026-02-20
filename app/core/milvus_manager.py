@@ -31,41 +31,47 @@ class MilvusManager:
         self.collection: Optional[Collection] = None
         logger.info(f"MilvusManager initialized for collection: {self.collection_name}")
     
+    def _connect_with_params(self, host: str) -> None:
+        """Connect with given host. Raises on failure."""
+        conn_params = {
+            "alias": "default",
+            "host": host,
+            "port": settings.milvus_port,
+        }
+        if settings.milvus_user and settings.milvus_password:
+            conn_params["user"] = settings.milvus_user
+            conn_params["password"] = settings.milvus_password
+        if settings.milvus_db:
+            conn_params["db_name"] = settings.milvus_db
+        connections.connect(**conn_params)
+
     def connect(self) -> bool:
         """
         Establish connection to Milvus server.
+        On Windows with Docker, localhost often fails; we retry with 127.0.0.1.
         
         Returns:
             True if connection successful, False otherwise
         """
-        try:
-            logger.info(f"Connecting to Milvus at {settings.milvus_host}:{settings.milvus_port}")
-            
-            # Build connection parameters
-            conn_params = {
-                "alias": "default",
-                "host": settings.milvus_host,
-                "port": settings.milvus_port
-            }
-            
-            # Add authentication if provided
-            if settings.milvus_user and settings.milvus_password:
-                conn_params["user"] = settings.milvus_user
-                conn_params["password"] = settings.milvus_password
-                logger.info("Using authenticated connection")
-            
-            # Add database name (Milvus 2.x supports multiple databases)
-            if settings.milvus_db:
-                conn_params["db_name"] = settings.milvus_db
-                logger.info(f"Connecting to database: {settings.milvus_db}")
-            
-            connections.connect(**conn_params)
-            logger.info("Successfully connected to Milvus")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to Milvus: {str(e)}")
-            return False
+        hosts_to_try = [settings.milvus_host]
+        if settings.milvus_host in ("localhost", "127.0.0.1"):
+            hosts_to_try.append("127.0.0.1" if settings.milvus_host == "localhost" else "localhost")
+        last_error = None
+        for host in hosts_to_try:
+            try:
+                logger.info(f"Connecting to Milvus at {host}:{settings.milvus_port}")
+                try:
+                    connections.disconnect("default")
+                except Exception:
+                    pass
+                self._connect_with_params(host)
+                logger.info("Successfully connected to Milvus")
+                return True
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Milvus connect failed ({host}:{settings.milvus_port}): {e}")
+        logger.error(f"Failed to connect to Milvus: {last_error}")
+        return False
     
     def disconnect(self):
         """Disconnect from Milvus server."""
@@ -137,7 +143,31 @@ class MilvusManager:
         except Exception as e:
             logger.error(f"Error creating collection: {str(e)}")
             return False
-    
+
+    def clear_collection(self) -> bool:
+        """
+        Drop the signatures collection so no similar-table data remains.
+        Next run will create a fresh collection. Use for full reset (no incremental-load history).
+        """
+        try:
+            if not self.connect():
+                return False
+            if utility.has_collection(self.collection_name):
+                utility.drop_collection(self.collection_name)
+                logger.info(f"Dropped Milvus collection: {self.collection_name}")
+                self.collection = None
+            else:
+                logger.info(f"Milvus collection '{self.collection_name}' does not exist")
+            self.disconnect()
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing Milvus collection: {e}")
+            try:
+                self.disconnect()
+            except Exception:
+                pass
+            return False
+
     def insert_signature(
         self,
         table_name: str,

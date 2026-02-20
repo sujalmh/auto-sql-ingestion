@@ -1,9 +1,24 @@
+import re
+import json
 from openai import OpenAI
 import pandas as pd
-import json
 from typing import Dict, List, Tuple
 from app.config import settings
 from app.core.logger import logger
+from app.core.column_utils import normalize_column_for_similarity
+def _normalize_column_for_similarity(col: str) -> str:
+    """Normalize column name for similarity so period/date differences don't separate matches.
+    E.g. 'no_of_schemes_as_on_dec_31_2025' and 'no_of_schemes_as_on_jan_31_2026' -> same base."""
+    if not col:
+        return col
+    s = col.lower()
+    # Remove date/period suffixes: _dec_31_2025, _jan_31_2026, _as_on_jan_31_2026, etc.
+    s = re.sub(r"_?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)_?\d{1,2}_?\d{4}", "", s)
+    s = re.sub(r"_\d{4}[-_]\d{2}[-_]\d{2}", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or col.lower()
+
+
 
 
 class SignatureBuilder:
@@ -109,7 +124,7 @@ class SignatureBuilder:
             logger.info(f"Embedding created: {len(embedding)} dimensions")
             
             return embedding
-            
+
         except Exception as e:
             logger.error(f"Error creating embedding: {str(e)}")
             raise
@@ -117,28 +132,27 @@ class SignatureBuilder:
     def _signature_to_text(self, signature: Dict) -> str:
         """
         Convert signature dictionary to text representation for embedding.
+        Column names are normalized (period/date stripped) so that Dec vs Jan
+        snapshots produce similar embeddings and match as incremental load.
         
         The text format emphasizes:
         - Table name and purpose
-        - Column structure (names and types)
+        - Column structure (normalized names and types)
         - Sample data patterns
-        
-        Args:
-            signature: Signature dictionary
-            
-        Returns:
-            Text representation of signature
         """
         parts = []
         
-        # Table name
-        parts.append(f"Table: {signature['table_name']}")
+        # Table name (normalize for monthly/snapshot tables so amfi_dec and amfi_jan match)
+        table_name = signature['table_name']
+        table_base = re.sub(r"_(?:dec|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov)\d*_?\d*$", "", table_name.lower())
+        parts.append(f"Table: {table_base or table_name}")
         
-        # Column structure
+        # Column structure: use normalized names so period-varying columns match
         parts.append(f"Columns ({len(signature['columns'])}):")
         for col in signature['columns']:
             col_type = signature['column_types'].get(col, 'UNKNOWN')
-            parts.append(f"  - {col}: {col_type}")
+            norm_col = normalize_column_for_similarity(col)
+            parts.append(f"  - {norm_col}: {col_type}")
         
         # Sample data patterns
         parts.append(f"Sample Data ({len(signature['sample_rows'])} rows):")

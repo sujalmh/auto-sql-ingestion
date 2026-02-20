@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Optional
@@ -31,6 +31,8 @@ from app.core.signature_builder import signature_builder
 from app.core.milvus_manager import milvus_manager
 from app.core.schema_validator import schema_validator
 from app.core.incremental_loader import incremental_loader
+from app.core.category_classifier import category_classifier
+from app.core.cat2_preprocessor import cat2_preprocessor
 from app.config import settings
 
 
@@ -73,6 +75,13 @@ async def shutdown_event():
 async def root():
     """Serve the web UI homepage."""
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.post("/admin/clear_jobs")
+async def clear_jobs():
+    """Clear all in-memory jobs. Use to start fresh."""
+    n = job_manager.clear_all()
+    return {"message": "All jobs cleared", "cleared": n}
 
 
 @app.post("/upload", response_model=UploadResponse)
@@ -266,6 +275,32 @@ async def get_status(job_id: str):
     return response
 
 
+@app.get("/job/{job_id}/export")
+async def export_job_data(job_id: str, format: str = "csv"):
+    """
+    Export the full processed table for a job (CSV or JSON).
+    Available when job has processed data (e.g. awaiting_approval, schema_mismatch).
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.processed_df is None:
+        raise HTTPException(status_code=404, detail="No processed data for this job")
+    table_name = (job.proposed_table_name or job_id).replace(" ", "_")
+    if format == "csv":
+        content = job.processed_df.to_csv(index=False).encode("utf-8")
+        return Response(
+            content=content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={table_name}.csv"},
+        )
+    if format == "json":
+        # to_json produces valid JSON (NaN -> null, dates as ISO)
+        content = job.processed_df.to_json(orient="records", date_format="iso")
+        return Response(content=content, media_type="application/json")
+    raise HTTPException(status_code=400, detail="format must be 'csv' or 'json'")
+
+
 @app.post("/approve/{job_id}")
 async def approve_job(
     job_id: str,
@@ -445,6 +480,10 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
         analysis = llm_architect.analyze_file_structure(df)
         logger.info(f"[Job {job_id}] Analysis complete: {analysis}")
         
+        # Step 2b: Classify as Category 1 or 2 (row-structure complexity)
+        classification = category_classifier.classify(df, analysis)
+        data_category = classification.get("category", 1)
+        
         # Step 3: Generate table name with LLM
         logger.info(f"[Job {job_id}] Generating table name with LLM")
         table_name = llm_architect.generate_table_name(df, analysis, file_description)
@@ -455,52 +494,58 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
         
         # Step 4: Preprocess data
         logger.info(f"[Job {job_id}] Preprocessing data")
-        processed_df, summary = preprocessor.preprocess(df, analysis)
+        if data_category == 2:
+            processed_df, summary = cat2_preprocessor.preprocess(df, analysis, classification)
+        else:
+            processed_df, summary = preprocessor.preprocess(df, analysis)
         logger.info(f"[Job {job_id}] Preprocessing complete: {summary}")
         
-        # Step 4b: Clean column names with LLM
+        # Step 4b: Clean column names with LLM (rename + drop redundant columns)
         logger.info(f"[Job {job_id}] Cleaning column names")
         original_columns = processed_df.columns.tolist()
         logger.info(f"[Job {job_id}] Original columns before cleaning: {original_columns}")
-        
-        column_mapping = llm_architect.clean_column_names(original_columns)
-        
-        # Apply cleaned column names
+
+        sample_rows = processed_df.head(3).to_dict("records") if len(processed_df) > 0 else None
+        clean_result = llm_architect.clean_column_names(
+            original_columns, sample_rows=sample_rows
+        )
+        column_mapping = clean_result.get("mapping", {})
+        drop_columns = clean_result.get("drop_columns", [])
+
+        # Drop redundant/metadata columns first
+        if drop_columns:
+            drop_present = [c for c in drop_columns if c in processed_df.columns]
+            if drop_present:
+                processed_df = processed_df.drop(columns=drop_present)
+                logger.info(f"[Job {job_id}] Dropped redundant/metadata columns: {drop_present}")
+
+        # Apply cleaned column names (mapping only includes kept columns)
         if column_mapping:
-            processed_df.rename(columns=column_mapping, inplace=True)
+            # Only rename columns that still exist
+            rename_map = {k: v for k, v in column_mapping.items() if k in processed_df.columns}
+            processed_df.rename(columns=rename_map, inplace=True)
             logger.info(f"[Job {job_id}] Columns after LLM cleaning: {processed_df.columns.tolist()}")
-            
-            # ALWAYS ensure unique column names (handle duplicates from LLM cleaning)
+
+            # Ensure unique column names (handle any remaining duplicates from LLM)
             cols = processed_df.columns.tolist()
             seen = {}
             new_cols = []
             duplicates_found = []
-            
             for idx, col in enumerate(cols):
                 if col in seen:
                     seen[col] += 1
-                    # Try to extract meaningful suffix from original column name
-                    orig_col = original_columns[idx]
-                    # Note: `self._extract_suffix_from_original` is not defined in this scope.
-                    # Assuming a simple counter-based suffix for now, similar to original logic.
-                    # If a more sophisticated suffix extraction is needed, a helper function
-                    # would need to be defined globally or passed in.
-                    suffix = str(seen[col]) # Placeholder for actual suffix extraction logic
+                    suffix = str(seen[col])
                     new_name = f"{col}_{suffix}"
                     new_cols.append(new_name)
-                    duplicates_found.append((col, new_name, orig_col))
+                    duplicates_found.append((col, new_name, original_columns[idx] if idx < len(original_columns) else col))
                 else:
                     seen[col] = 0
                     new_cols.append(col)
-            
             if duplicates_found:
                 processed_df.columns = new_cols
-                logger.warning(f"[Job {job_id}] Fixed {len(duplicates_found)} duplicate column names:")
-                for old, new, orig in duplicates_found:
-                    logger.warning(f"  '{old}' → '{new}' (from original: '{orig}')")
-            
+                logger.warning(f"[Job {job_id}] Fixed {len(duplicates_found)} duplicate column names")
             logger.info(f"[Job {job_id}] Final columns: {processed_df.columns.tolist()}")
-            logger.info(f"[Job {job_id}] Renamed {len(column_mapping)} columns")
+            logger.info(f"[Job {job_id}] Renamed {len(rename_map)} columns")
         
         # Step 5: Infer column types with LLM
         logger.info(f"[Job {job_id}] Inferring column types with LLM")
@@ -521,7 +566,8 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
             'period_column': period_col,
             'data_domain': data_domain,
             'major_domain': major_domain,
-            'sub_domain': sub_domain
+            'sub_domain': sub_domain,
+            'data_category': data_category,
         }
         logger.info(f"[Job {job_id}] Metadata generated - Domain: {data_domain}, Major: {major_domain}")
         
@@ -682,7 +728,7 @@ async def insert_to_database(job_id: str, table_name: str, user_metadata):
         
         # Step 3: Insert data
         logger.info(f"[Job {job_id}] Inserting data into table")
-        rows_inserted = db_manager.insert_data(table_name, job.processed_df)
+        rows_inserted = db_manager.insert_data(table_name, job.processed_df, column_types=job.column_types)
         logger.info(f"[Job {job_id}] Inserted {rows_inserted} rows")
         
         # Step 4: Insert metadata into tables_metadata
@@ -873,4 +919,4 @@ async def perform_incremental_load(job_id: str, table_name: str, user_metadata):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     milvus_collection: str = "sql_table_signatures"
     milvus_db: str = "default"  # Milvus database name
     
-    # Similarity Search Configuration
-    similarity_threshold: float = 0.85
+    # Similarity Search Configuration (threshold allows Dec/Jan-style period variants to match)
+    similarity_threshold: float = 0.78
     similarity_top_k: int = 5
     
     # OpenAI Embeddings

@@ -114,11 +114,35 @@ class DatabaseManager:
             logger.error(f"Error creating table '{table_name}': {str(e)}")
             return False
     
+    def _normalize_date_columns(self, df: pd.DataFrame, column_types: Dict[str, str]) -> pd.DataFrame:
+        """
+        Parse ambiguous date strings (e.g. DD-MM-YY) into ISO 8601 (YYYY-MM-DD)
+        so PostgreSQL accepts them regardless of its datestyle setting.
+        """
+        date_type_keywords = ('DATE', 'TIMESTAMP')
+        for col, col_type in column_types.items():
+            if col not in df.columns:
+                continue
+            if not any(kw in col_type.upper() for kw in date_type_keywords):
+                continue
+            try:
+                parsed = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+                non_null_ratio = parsed.notna().sum() / max(len(parsed), 1)
+                if non_null_ratio >= 0.5:
+                    df[col] = parsed.dt.strftime('%Y-%m-%d').where(parsed.notna(), other=None)
+                    logger.info(f"Normalized date column '{col}' to ISO format ({non_null_ratio:.0%} parsed)")
+                else:
+                    logger.warning(f"Column '{col}' typed as {col_type} but only {non_null_ratio:.0%} parsed as dates, leaving as-is")
+            except Exception as e:
+                logger.warning(f"Could not normalize date column '{col}': {e}")
+        return df
+
     def insert_data(
         self,
         table_name: str,
         df: pd.DataFrame,
-        batch_size: int = 1000
+        batch_size: int = 1000,
+        column_types: Optional[Dict[str, str]] = None
     ) -> int:
         """
         Insert DataFrame data into PostgreSQL table using batch operations.
@@ -127,6 +151,7 @@ class DatabaseManager:
             table_name: Name of the target table
             df: DataFrame to insert
             batch_size: Number of rows per batch
+            column_types: Optional dict of column→PostgreSQL type for date normalization
             
         Returns:
             Number of rows inserted
@@ -134,6 +159,9 @@ class DatabaseManager:
         logger.info(f"Inserting {len(df)} rows into table '{table_name}'")
         
         try:
+            if column_types:
+                df = self._normalize_date_columns(df.copy(), column_types)
+
             # Prepare column names and data
             columns = df.columns.tolist()
             safe_columns = [self._sanitize_identifier(col) for col in columns]
@@ -225,6 +253,23 @@ class DatabaseManager:
             logger.error(f"Error getting table info for '{table_name}': {str(e)}")
             return None
     
+    @staticmethod
+    def _columns_to_str(columns) -> str:
+        """Normalize columns to a comma-separated string. Handles list of dicts (e.g. [{'name': 'x'}])."""
+        if columns is None:
+            return ""
+        if isinstance(columns, str):
+            return columns
+        if isinstance(columns, (list, tuple)):
+            parts = []
+            for item in columns:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("name", item.get("column_name", str(item)))))
+                else:
+                    parts.append(str(item))
+            return ", ".join(parts)
+        return str(columns)
+
     def insert_tables_metadata(self, metadata: Dict) -> bool:
         """Insert metadata record into tables_metadata table."""
         logger.info(f"Inserting metadata for table '{metadata.get('table_name')}'")
@@ -239,7 +284,8 @@ class DatabaseManager:
             """
             
             values = (
-                metadata.get('data_domain'), metadata.get('table_name'), metadata.get('columns'),
+                metadata.get('data_domain'), metadata.get('table_name'),
+                self._columns_to_str(metadata.get('columns')),
                 metadata.get('comments'), metadata.get('source'), metadata.get('source_url'),
                 metadata.get('released_on'), metadata.get('updated_on'), metadata.get('rows_count'),
                 metadata.get('business_metadata'), metadata.get('table_view', 'table'),
@@ -273,8 +319,8 @@ class DatabaseManager:
                 metadata.get('table_name'), metadata.get('table_view', 'Table'),
                 metadata.get('period_cols'), metadata.get('first_available_value'),
                 metadata.get('last_available_value'), metadata.get('last_updated_on'),
-                metadata.get('rows_count'), metadata.get('columns'), metadata.get('source_url'),
-                metadata.get('business_metadata'), metadata.get('major_domain'),
+                metadata.get('rows_count'), self._columns_to_str(metadata.get('columns')),
+                metadata.get('source_url'), metadata.get('business_metadata'), metadata.get('major_domain'),
                 metadata.get('sub_domain'), metadata.get('brief_summary')
             )
             
@@ -287,6 +333,48 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error inserting operational_metadata: {str(e)}")
             return False
+
+    def list_tables_from_metadata(self) -> List[str]:
+        """Return table_name from every row in tables_metadata (ingestion-created tables)."""
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT table_name FROM tables_metadata")
+                    return [row[0] for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing tables from metadata: {e}")
+            return []
+
+    def drop_ingestion_tables_and_metadata(self) -> Dict[str, int]:
+        """
+        Drop all tables listed in tables_metadata, then delete from tables_metadata
+        and operational_metadata. Returns {"tables_dropped": n, "metadata_cleared": 1}.
+        """
+        dropped = 0
+        try:
+            tables = self.list_tables_from_metadata()
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    for table_name in tables:
+                        try:
+                            cur.execute(
+                                sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                                    sql.Identifier(table_name)
+                                )
+                            )
+                            dropped += 1
+                            logger.info(f"Dropped table: {table_name}")
+                        except Exception as e:
+                            logger.warning(f"Could not drop {table_name}: {e}")
+                    for meta_table in ("tables_metadata", "operational_metadata"):
+                        try:
+                            cur.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(meta_table)))
+                        except Exception as e:
+                            logger.debug(f"Could not clear {meta_table} (may not exist): {e}")
+            return {"tables_dropped": dropped, "metadata_cleared": 1}
+        except Exception as e:
+            logger.error(f"Error in drop_ingestion_tables_and_metadata: {e}")
+            raise
 
 
 # Global database manager instance

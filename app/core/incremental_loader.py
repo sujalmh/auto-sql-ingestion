@@ -131,7 +131,8 @@ class IncrementalLoader:
             # Returns number of rows inserted
             rows_inserted = db_manager.insert_data(
                 table_name=table_name,
-                df=aligned_df
+                df=aligned_df,
+                column_types=column_types
             )
             
             if rows_inserted > 0:

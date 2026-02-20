@@ -80,3 +80,7 @@ Thumbs.db
 *.backup
 temp/
 tmp/
+
+# MCP / IDE
+mcps/
+*.lock

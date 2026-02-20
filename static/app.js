@@ -226,6 +226,18 @@ function showILPreview(data) {
     const ilPreview = data.incremental_load_preview;
     const duplicateDetection = data.duplicate_detection;
 
+    if (!ilPreview) {
+        document.getElementById('validation-status').innerHTML =
+            '<div class="status-incompatible">Preview could not be loaded for this job. Refresh the page or re-upload the file.</div>';
+        document.getElementById('il-table-name').textContent = '-';
+        document.getElementById('il-similarity').textContent = '-';
+        document.getElementById('il-current-rows').textContent = '0';
+        document.getElementById('il-new-rows').textContent = '0';
+        document.getElementById('il-total-rows').textContent = '0';
+        document.getElementById('il-preview-table-container').innerHTML = '';
+        return;
+    }
+
     // Show duplicate warning if detected
     if (duplicateDetection && (duplicateDetection.status === 'DUPLICATE' || duplicateDetection.status === 'PARTIAL_OVERLAP')) {
         const warningBox = document.getElementById('duplicate-warning');

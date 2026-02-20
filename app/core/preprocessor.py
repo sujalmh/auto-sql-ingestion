@@ -1,5 +1,6 @@
 import pandas as pd
 import re
+from datetime import date
 from typing import Dict, List, Optional
 from app.core.logger import logger
 
@@ -379,6 +380,12 @@ class DataPreprocessor:
         # Step 3: Clean data (includes dropping empty columns)
         df = self.clean_data(df)
         
+        # Step 4: Add standard columns (refresh_date, data_period when determinable)
+        df["refresh_date"] = date.today().isoformat()
+        data_period = analysis.get("data_period")
+        if data_period:
+            df["data_period"] = self._normalize_mmm_yyyy(data_period)
+        
         # Check if any columns were dropped
         dropped_cols = original_col_count - len(df.columns)
         if dropped_cols > 0:
@@ -390,6 +397,31 @@ class DataPreprocessor:
         logger.info(f"Preprocessing completed: {summary}")
         
         return df, summary
+
+    def _normalize_mmm_yyyy(self, value: str) -> str:
+        """Convert period string to Mmm-yyyy (e.g. Dec 2025)."""
+        if not value or not str(value).strip():
+            return value
+        value = str(value).strip()
+        month_abbr = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+        if re.match(r"^\d{1,2}-\d{4}$", value):
+            m, y = value.split("-")
+            return f"{month_abbr[int(m) - 1]} {y}"
+        if re.match(r"^\d{4}-\d{1,2}$", value):
+            y, m = value.split("-")
+            return f"{month_abbr[int(m) - 1]} {y}"
+        year_m = re.search(r"\b(20\d{2})\b", value)
+        months_lower = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+        month_num = None
+        for name, num in months_lower.items():
+            if name in value.lower():
+                month_num = num
+                break
+        if year_m and month_num is not None:
+            return f"{month_abbr[month_num - 1]} {year_m.group(1)}"
+        return value
 
 
 # Global preprocessor instance

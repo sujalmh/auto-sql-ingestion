@@ -1,7 +1,7 @@
 from openai import OpenAI
 import pandas as pd
 import json
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from app.config import settings
 from app.core.logger import logger
 
@@ -59,18 +59,18 @@ File Information:
 - First 10 rows sample: {json.dumps(file_info['first_10_rows'], indent=2, default=str)}
 
 Tasks:
-1. Identify if there are date/timestamp values in column headers that should be transformed into rows
+1. date_columns: List ONLY columns whose HEADER VALUE is a period/year (e.g. "2011-12", "2012-13", "Q1", "January") for wide-to-long melt. Leave date_columns EMPTY if columns are metric names that merely mention a date in the description (e.g. "Funds Mobilised for the month of Dec 2025 (INR in crore)" or "No. of Schemes as on Dec 31, 2025")—those are single-point metrics, not time-series columns to melt.
 2. Detect if headers span multiple levels and need merging. This includes:
    - Pandas MultiIndex columns
    - First few rows containing header information (e.g., "Unit value index" spanning multiple columns)
    - Look for patterns where first rows have duplicate values or many NaN values
 3. Identify the grain/dimensionality of the data (e.g., State-wise, Category-wise, Monthly)
 4. Suggest preprocessing strategy
+5. data_period: When column names or context indicate a single reference date for the data (e.g. "as on Dec 31, 2025", "for the month of Dec 2025", "December 2025"), extract it and return in Mmm-yyyy format (e.g. "Dec 2025"). Use for the final table so each row has the "time of data". Omit or null if not determinable.
 
-IMPORTANT: Check if the first 1-3 rows look like headers rather than data. Headers typically have:
-- Duplicate values across columns (indicating grouped headers)
-- Many NaN/empty values
-- Text values when rest of data is numeric
+IMPORTANT for needs_header_merge:
+- Set needs_header_merge TRUE only when MULTIPLE ROWS together form the COLUMN NAMES (e.g. row 0 = "Category", row 1 = "Year | State | Value" with labels in MANY columns).
+- Set needs_header_merge FALSE when the first rows have text only in the FIRST 1-2 columns and the rest empty/NaN. Those are SECTION or CATEGORY title rows (e.g. "A" / "Open ended Schemes", "I" / "Income/Debt..."), not column header rows. The table already has one row of column names; do not merge section rows into headers.
 
 Respond in JSON format:
 {{
@@ -80,7 +80,8 @@ Respond in JSON format:
     "header_merge_reason": "explanation if needs_header_merge is true",
     "data_grain": "description of data granularity",
     "domain": "data domain (e.g., IIP, GDP, Trade, etc.)",
-    "preprocessing_strategy": "brief description of recommended preprocessing"
+    "preprocessing_strategy": "brief description of recommended preprocessing",
+    "data_period": "Mmm-yyyy e.g. Dec 2025 when data has a single reference date from column names; omit if not determinable"
 }}"""
         
         try:
@@ -108,7 +109,8 @@ Respond in JSON format:
                 "header_merge_reason": "",
                 "data_grain": "unknown",
                 "domain": "unknown",
-                "preprocessing_strategy": "standard cleaning"
+                "preprocessing_strategy": "standard cleaning",
+                "data_period": None,
             }
     
     def generate_table_name(self, df: pd.DataFrame, analysis: Dict, file_description: str = None) -> str:
@@ -316,26 +318,24 @@ Example: {{"column_name": "VARCHAR(200)", "amount": "NUMERIC(15, 2)", "date": "T
         logger.info("Detecting header row count with LLM")
         try:
             markdown = df_head.to_markdown(index=False)
-            prompt = f"""Analyze this Excel/CSV data preview and count ONLY the header rows (column labels), NOT data rows.
+            prompt = f"""Analyze this Excel/CSV data preview and count ONLY the true column-header rows.
 
 Data Preview:
 {markdown}
 
-CRITICAL RULES:
-1. Header rows contain DESCRIPTIVE LABELS (e.g., "Year", "State", "GDP", "Category")
-2. Data rows contain ACTUAL VALUES (e.g., "2023", "Maharashtra", "15000", specific numbers/text)
-3. If the FIRST row has descriptive labels and SECOND row has actual data → return 1
-4. If FIRST TWO rows both have descriptive labels (e.g., main category + subcategory) → return 2
-5. If FIRST THREE rows all have descriptive labels → return 3
+DEFINITION OF A COLUMN-HEADER ROW:
+- A row that provides the NAME OF EACH COLUMN (e.g. "Sr", "Scheme Name", "No. of Schemes", "Amount").
+- Such a row has NON-EMPTY or MEANINGFUL labels in MANY columns (at least 3–4+ columns across the row).
 
-COMMON MISTAKE TO AVOID:
-- DO NOT count a data row as a header just because it's in the first few rows
-- Look for patterns: headers are typically short descriptive text, data rows have varied values
+NOT COLUMN HEADERS (do NOT count these):
+- Section or category title rows: only the FIRST 1–2 columns have text, the REST are empty or dashes.
+  Example: row with "A" and "Open ended Schemes" in first two cells and empty elsewhere = section header, NOT a column header.
+- Rows with roman numerals (I, II, III) or single letters (A, B) in the first column and a category name in the second, with other columns empty = structural/section rows. Return 1 so only the real column title row is used.
+- Subtotal rows, data rows, or footer rows.
 
-Examples:
-- Row 1: "Year | State | Value" → 1 header row
-- Row 1: "Economic Indicators" Row 2: "Year | State | Value" → 2 header rows
-- Row 1: "2023 | Delhi | 5000" → 1 header row (the actual column names are likely row 0, which is already parsed)
+RULES:
+- If row 0 has labels in many columns (true column titles) and row 1 has only 1–2 cells filled (e.g. section title) → return 1.
+- Only return 2 or 3 when you see TWO or THREE consecutive rows that each have labels spanning MANY columns (e.g. merged Excel headers where row 0 = "Category", row 1 = "Year | State | Value" with values in many columns).
 
 Respond with ONLY a single number: 1, 2, or 3"""
             
@@ -387,15 +387,38 @@ Return ONLY the shortened name."""
             logger.error(f"Error refining name: {str(e)}")
             return table_name[:40]
     
-    def clean_column_names(self, columns: list) -> dict:
-        """Clean messy column names ensuring uniqueness."""
+    def clean_column_names(
+        self,
+        columns: list,
+        sample_rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Clean and normalize column names; detect redundant columns to drop.
+        Returns {"mapping": {orig: renamed, ...}, "drop_columns": [orig, ...]}.
+        """
         logger.info(f"Cleaning {len(columns)} column names")
         try:
-            import json
-            prompt = f"""You are cleaning database column names. CRITICAL: All output names MUST be unique.
+            prompt = f"""You are normalizing column names for a database table. Your goals:
+1. Produce clear, semantic snake_case names (lowercase, underscores, max 50 chars).
+2. Remove redundant columns: when two or more columns carry the same semantic meaning or identical values, keep ONE with a canonical name and list the others in "drop_columns".
+3. Optionally drop metadata-only columns (e.g. ingestion timestamp, refresh_date) if they add no analytical value; otherwise keep with a clear name.
 
 INPUT COLUMNS:
 {json.dumps(columns, indent=2)}
+"""
+            if sample_rows:
+                prompt += f"""
+SAMPLE ROW DATA (use to detect redundant columns—e.g. same values in two columns = duplicate):
+{json.dumps(sample_rows[:3], indent=2, default=str)}
+"""
+            prompt += """
+NAMING RULES (apply to any file; do not hardcode for one dataset):
+- Strip numeric suffixes that denote duplicate/copy columns (e.g. year_2, year_2_1 → both mean "year"; keep one as "year", add the other to drop_columns).
+- Remove dates, timestamps, or large numbers appended to names (e.g. "_2025-05-30", "_23117503.01").
+- Remove special characters: (), [], etc. Replace spaces with underscores.
+- Use semantic names: prefer meaning over raw labels (e.g. "india_news" → "india_policy_uncertainty_index" or "policy_uncertainty_index" if context is clear; "description_english" → "description").
+- If two columns are semantically different, preserve what distinguishes them (e.g. adjusted vs unadjusted, total vs net).
+- Every output name in "mapping" MUST be unique.
 
 STEP-BY-STEP PROCESS:
 1. Remove dates and numeric values (e.g., "_2025-05-30", "_23117503.01")
@@ -415,6 +438,10 @@ Output: "aggregate_deposits_adjusted"  ← Note: preserved "adjusted"
 Input: "Investment In India (8+9)_6706717.241"
 Output: "investment_in_india"
 
+Input: "India News-Based Policy Uncertainty Index"
+Output: "india_news_based_policy_uncertainty_index"
+(For long descriptive titles like this, always use the full snake_case form; do not abbreviate to fewer words.)
+
 Input: "Investment In India (8+9) (Adjusted)_6660129.361"
 Output: "investment_in_india_adjusted"  ← Note: preserved "adjusted"
 
@@ -432,31 +459,60 @@ CRITICAL RULES:
 - Use snake_case, lowercase only
 - Economics/financial context
 
-Return JSON mapping each input to its unique output name:
-{{"input_column_name": "unique_output_name", ...}}"""
+FULL INPUT/OUTPUT EXAMPLE:
+
+Input columns: ["Sr No.", "Scheme Name", "No. of Schemes_2025-05-30", "Net Assets Under Management (Rs Crore)", "Net Assets Under Management (Rs Crore) (Adjusted)_23117503.01"]
+Output:
+{{
+  "mapping": {{
+    "Sr No.": "sr_no",
+    "Scheme Name": "scheme_name",
+    "No. of Schemes_2025-05-30": "no_of_schemes",
+    "Net Assets Under Management (Rs Crore)": "net_aum_rs_crore",
+    "Net Assets Under Management (Rs Crore) (Adjusted)_23117503.01": "net_aum_rs_crore_adjusted"
+  }},
+  "drop_columns": []
+}}
+
+Return ONLY a JSON object with exactly two keys: "mapping" and "drop_columns".
+- "mapping": an object where each key is an original column name and each value is the cleaned snake_case name.
+- "drop_columns": a list of original column names to drop."""
             
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                temperature=0.1  # Lower temperature for more consistent output
+                temperature=0.1,
             )
-            mapping = json.loads(response.choices[0].message.content)
-            
+            raw = response.choices[0].message.content
+            if not raw:
+                raise ValueError("LLM returned empty column-cleaning response")
+            data = json.loads(raw)
+            mapping = data.get("mapping", {})
+            drop_columns = data.get("drop_columns", [])
+            if not isinstance(drop_columns, list):
+                drop_columns = []
+
+            # Ensure we have a mapping for every column that is not dropped
+            for col in columns:
+                if col not in drop_columns and col not in mapping:
+                    mapping[col] = col
+
             # Validate uniqueness of cleaned names
-            cleaned_values = list(mapping.values())
+            cleaned_values = [mapping[c] for c in mapping if c not in drop_columns]
             duplicates = [v for v in set(cleaned_values) if cleaned_values.count(v) > 1]
-            
             if duplicates:
-                logger.warning(f"LLM returned {len(duplicates)} duplicate names: {duplicates}")
-                logger.warning("Applying post-processing to fix duplicates")
-                mapping = self._ensure_unique_column_names(columns, mapping)
-            
-            logger.info(f"Cleaned {len(mapping)} column names (all unique)")
-            return mapping
+                logger.warning(f"LLM returned duplicate names: {duplicates}; applying post-processing")
+                kept_cols = [c for c in columns if c not in drop_columns]
+                mapping = self._ensure_unique_column_names(kept_cols, {k: mapping[k] for k in kept_cols})
+
+            logger.info(
+                f"Cleaned {len(mapping)} column names, drop {len(drop_columns)}: {drop_columns}"
+            )
+            return {"mapping": mapping, "drop_columns": drop_columns}
         except Exception as e:
             logger.error(f"Error cleaning names: {str(e)}")
-            return {col: col for col in columns}
+            return {"mapping": {col: col for col in columns}, "drop_columns": []}
     
     def _ensure_unique_column_names(self, original_cols: list, mapping: dict) -> dict:
         """Ensure all column names are unique by adding meaningful suffixes."""

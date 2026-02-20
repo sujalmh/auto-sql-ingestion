@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple
 from app.core.database import db_manager
 from app.core.logger import logger
+from app.core.column_utils import normalize_column_for_similarity
 
 
 class SchemaValidator:
@@ -63,6 +64,40 @@ class SchemaValidator:
         except Exception as e:
             logger.error(f"Error fetching table metadata: {str(e)}")
             return None
+
+    def find_similar_table_by_columns(
+        self,
+        new_columns: List[str],
+        min_overlap: float = 0.7,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Fallback when Milvus is unavailable or returns no results: find an existing
+        table whose columns overlap with new_columns (after normalizing period/date
+        in names) so that e.g. Jan upload can match Dec table without Milvus.
+        Returns (table_name, score) or None.
+        """
+        tables = db_manager.list_tables_from_metadata()
+        if not tables:
+            logger.info("No tables in tables_metadata for fallback match")
+            return None
+        new_norm = {normalize_column_for_similarity(c) for c in new_columns}
+        if not new_norm:
+            return None
+        best_table, best_score = None, 0.0
+        for table_name in tables:
+            meta = self.fetch_table_metadata(table_name)
+            if not meta or not meta.get("columns"):
+                continue
+            existing_norm = {normalize_column_for_similarity(c) for c in meta["columns"]}
+            if not existing_norm:
+                continue
+            overlap = len(new_norm & existing_norm) / len(existing_norm)
+            if overlap >= min_overlap and overlap > best_score:
+                best_score = overlap
+                best_table = table_name
+        if best_table is not None:
+            logger.info(f"Fallback match: {best_table} (normalized column overlap: {best_score:.2%})")
+        return (best_table, best_score) if best_table else None
     
     def validate_schema_match(
         self,
