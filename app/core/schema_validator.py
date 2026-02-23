@@ -1,5 +1,5 @@
 from typing import Dict, List, Optional, Tuple
-from app.core.database import db_manager
+from app.core.database import db_manager, _WIDENING_GROUPS
 from app.core.logger import logger
 from app.core.column_utils import normalize_column_for_similarity
 
@@ -98,35 +98,76 @@ class SchemaValidator:
         if best_table is not None:
             logger.info(f"Fallback match: {best_table} (normalized column overlap: {best_score:.2%})")
         return (best_table, best_score) if best_table else None
-    
+
+    def compare_column_types(
+        self,
+        new_types: Dict[str, str],
+        existing_types: Dict[str, str]
+    ) -> Dict[str, Dict]:
+        """
+        Detect per-column type drift between incoming CSV schema and the current table.
+
+        Args:
+            new_types:      {col_name_lower: inferred_pg_type} for the CSV.
+            existing_types: {col_name_lower: pg_type} from information_schema.
+
+        Returns:
+            {col_name: {"from": existing, "to": incoming, "safe": bool}}
+            Only columns with actual type differences are returned.
+        """
+        _ALIASES: Dict[str, str] = {
+            "int": "integer", "int4": "integer", "int8": "bigint",
+            "int2": "smallint", "serial": "integer", "bigserial": "bigint",
+            "float4": "real", "float8": "double precision", "float": "double precision",
+            "varchar": "character varying", "char": "character",
+            "bool": "boolean", "decimal": "numeric",
+            "timestamp": "timestamp without time zone",
+            "timestamptz": "timestamp with time zone",
+        }
+
+        def normalise(t: str) -> str:
+            t = t.strip().lower()
+            return _ALIASES.get(t, t)
+
+        mismatches: Dict[str, Dict] = {}
+        for col, new_type in new_types.items():
+            if col not in existing_types:
+                continue
+            existing_type = normalise(existing_types[col])
+            incoming_type = normalise(new_type)
+            if existing_type == incoming_type or incoming_type == "text":
+                continue
+            safe = incoming_type in _WIDENING_GROUPS.get(existing_type, [])
+            mismatches[col] = {"from": existing_type, "to": incoming_type, "safe": safe}
+        return mismatches
+
     def validate_schema_match(
         self,
         new_columns: List[str],
-        existing_columns: List[str]
+        existing_columns: List[str],
+        new_types: Optional[Dict[str, str]] = None,
+        existing_types: Optional[Dict[str, str]] = None
     ) -> Dict:
         """
         Compare new file columns with existing table columns.
-        
+
         Args:
-            new_columns: List of column names from new file
-            existing_columns: List of column names from existing table
-            
+            new_columns:    Column names from the new file.
+            existing_columns: Column names from the existing table.
+            new_types:      Optional {col_lower: pg_type} for type comparison.
+            existing_types: Optional {col_lower: pg_type} from the actual table.
+
         Returns:
-            Dictionary with validation results:
-            {
-                'is_compatible': bool,
-                'missing_columns': [],  # Columns in existing but not in new
-                'extra_columns': [],    # Columns in new but not in existing
-                'matching_columns': [], # Columns present in both
-                'match_percentage': float
-            }
+            Dict with: is_compatible, is_additive_evolution, missing_columns,
+            extra_columns, matching_columns, match_percentage, type_mismatches.
         """
         logger.info(f"Validating schema match: {len(new_columns)} new vs {len(existing_columns)} existing")
-        
-        # Convert to sets for comparison
+
+        # Convert to sets (exclude pipeline-managed audit column)
         new_set = set(col.lower() for col in new_columns)
-        existing_set = set(col.lower() for col in existing_columns)
-        
+        existing_set = set(
+            col.lower() for col in existing_columns if col.lower() != "ingested_at"
+        )
         # Find differences
         missing_columns = list(existing_set - new_set)  # In existing but not in new
         extra_columns = list(new_set - existing_set)    # In new but not in existing
@@ -138,27 +179,44 @@ class SchemaValidator:
         else:
             match_percentage = 0.0
         
-        # Determine compatibility
-        # Exact match required for auto-execution
-        is_compatible = (len(missing_columns) == 0 and len(extra_columns) == 0)
-        
+        # Determine compatibility with type awareness
+        type_mismatches = self.compare_column_types(
+            new_types=new_types or {},
+            existing_types=existing_types or {}
+        )
+        has_unsafe = any(not v["safe"] for v in type_mismatches.values())
+        is_compatible = (
+            len(missing_columns) == 0
+            and len(extra_columns) == 0
+        )
+        # Relaxed: allow additive-only changes without human intervention
+        is_additive_evolution = (
+            len(missing_columns) == 0   # nothing dropped from the file
+            and not has_unsafe           # no unsafe type changes
+        )
+
         validation_result = {
             'is_compatible': is_compatible,
+            'is_additive_evolution': is_additive_evolution,
             'missing_columns': sorted(missing_columns),
             'extra_columns': sorted(extra_columns),
             'matching_columns': sorted(matching_columns),
-            'match_percentage': round(match_percentage, 2)
+            'match_percentage': round(match_percentage, 2),
+            'type_mismatches': type_mismatches,
         }
-        
-        logger.info(f"Validation result: compatible={is_compatible}, match={match_percentage:.2f}%")
-        
-        if not is_compatible:
-            logger.warning(f"Schema mismatch detected:")
+
+        logger.info(
+            f"Validation result: compatible={is_compatible}, "
+            f"additive_evolution={is_additive_evolution}, match={match_percentage:.2f}%"
+        )
+
+        if not is_compatible and not is_additive_evolution:
+            logger.warning("Schema incompatibility detected:")
             if missing_columns:
-                logger.warning(f"  - Missing columns: {missing_columns}")
+                logger.warning(f"  - Dropped columns (ALERT): {missing_columns}")
             if extra_columns:
-                logger.warning(f"  - Extra columns: {extra_columns}")
-        
+                logger.warning(f"  - New columns (will be added): {extra_columns}")
+
         return validation_result
     
     def generate_discrepancy_report(
@@ -190,32 +248,56 @@ class SchemaValidator:
         report_lines.append("")
         
         if validation_result['is_compatible']:
-            report_lines.append("✓ COMPATIBLE - Schemas match exactly")
+            report_lines.append("✓ FULLY COMPATIBLE - Schemas match exactly")
             report_lines.append(f"  All {len(validation_result['matching_columns'])} columns match")
+        elif validation_result.get('is_additive_evolution', False):
+            report_lines.append("~ ADDITIVE EVOLUTION - New columns will be added automatically")
+            report_lines.append("  Existing rows will receive NULL for new columns.")
+            report_lines.append("")
+            if validation_result['extra_columns']:
+                report_lines.append(f"New Columns to Add ({len(validation_result['extra_columns'])}) [AUTO]:")
+                for col in validation_result['extra_columns']:
+                    report_lines.append(f"    + {col}")
         else:
-            report_lines.append("✗ INCOMPATIBLE - Schema differences detected")
+            report_lines.append("✗ INCOMPATIBLE - Schema differences require review")
             report_lines.append("")
             
             if validation_result['missing_columns']:
-                report_lines.append(f"Missing Columns ({len(validation_result['missing_columns'])}):")
-                report_lines.append("  These columns exist in the table but not in the new file:")
+                report_lines.append(f"Dropped Columns ({len(validation_result['missing_columns'])}) [ALERT]:")
+                report_lines.append("  Present in table but absent from new file:")
                 for col in validation_result['missing_columns']:
                     report_lines.append(f"    - {col}")
                 report_lines.append("")
             
             if validation_result['extra_columns']:
-                report_lines.append(f"Extra Columns ({len(validation_result['extra_columns'])}):")
-                report_lines.append("  These columns exist in the new file but not in the table:")
+                report_lines.append(f"New Columns ({len(validation_result['extra_columns'])}) [WILL BE ADDED]:")
                 for col in validation_result['extra_columns']:
                     report_lines.append(f"    + {col}")
                 report_lines.append("")
-            
-            if validation_result['matching_columns']:
-                report_lines.append(f"Matching Columns ({len(validation_result['matching_columns'])}):")
-                for col in validation_result['matching_columns'][:10]:  # Show first 10
-                    report_lines.append(f"    ✓ {col}")
-                if len(validation_result['matching_columns']) > 10:
-                    report_lines.append(f"    ... and {len(validation_result['matching_columns']) - 10} more")
+
+        # Type mismatches
+        type_mismatches = validation_result.get('type_mismatches', {})
+        if type_mismatches:
+            safe_changes    = {k: v for k, v in type_mismatches.items() if v['safe']}
+            unsafe_changes  = {k: v for k, v in type_mismatches.items() if not v['safe']}
+            if safe_changes:
+                report_lines.append(f"Safe Type Widenings ({len(safe_changes)}) [AUTO]:")
+                for col, info in safe_changes.items():
+                    report_lines.append(f"    ~ {col}: {info['from']} → {info['to']}")
+                report_lines.append("")
+            if unsafe_changes:
+                report_lines.append(f"Unsafe Type Changes ({len(unsafe_changes)}) [WARNING]:")
+                for col, info in unsafe_changes.items():
+                    report_lines.append(f"    ✗ {col}: {info['from']} → {info['to']}")
+                report_lines.append("")
+
+        if validation_result['matching_columns']:
+            report_lines.append(f"Matching Columns ({len(validation_result['matching_columns'])}):")
+            for col in validation_result['matching_columns'][:10]:  # Show first 10
+                report_lines.append(f"    ✓ {col}")
+            if len(validation_result['matching_columns']) > 10:
+                report_lines.append(f"    ... and {len(validation_result['matching_columns']) - 10} more")
+
         
         report_lines.append("=" * 80)
         
@@ -228,34 +310,43 @@ class SchemaValidator:
         self,
         table_name: str,
         new_columns: List[str],
-        new_file_name: str = "uploaded file"
+        new_file_name: str = "uploaded file",
+        new_types: Optional[Dict[str, str]] = None,
+        existing_types: Optional[Dict[str, str]] = None
     ) -> Tuple[bool, Dict, str]:
         """
         Complete validation workflow for incremental load.
-        
+
         Args:
-            table_name: Name of the existing table
-            new_columns: List of column names from new file
-            new_file_name: Name of the new file (optional)
-            
+            table_name:     Name of the existing table.
+            new_columns:    Column names from the new file.
+            new_file_name:  Name of the new file (for the report).
+            new_types:      Optional {col_lower: pg_type} for the CSV (type-drift detection).
+            existing_types: Optional {col_lower: pg_type} from the actual table.
+
         Returns:
             Tuple of (is_compatible, validation_result, report)
         """
         logger.info(f"Starting incremental load validation for: {table_name}")
-        
+
         # Fetch existing table metadata
         metadata = self.fetch_table_metadata(table_name)
-        
+
         if not metadata:
             logger.error(f"Cannot validate - table metadata not found: {table_name}")
             return False, {}, f"Error: Table '{table_name}' not found in metadata"
-        
-        # Validate schema match
-        validation_result = self.validate_schema_match(new_columns, metadata['columns'])
-        
+
+        # Validate schema match (with optional type comparison)
+        validation_result = self.validate_schema_match(
+            new_columns, metadata['columns'],
+            new_types=new_types,
+            existing_types=existing_types
+        )
+
         # Generate report
         report = self.generate_discrepancy_report(validation_result, table_name, new_file_name)
-        
+
+        # Return is_compatible — for routing, callers can also inspect is_additive_evolution
         return validation_result['is_compatible'], validation_result, report
     
     def compare_period_values(self, value1: str, value2: str) -> Tuple[bool, str]:

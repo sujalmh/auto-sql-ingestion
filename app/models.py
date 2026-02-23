@@ -52,12 +52,14 @@ class SimilarTableMatch(BaseModel):
 
 class SchemaValidationResult(BaseModel):
     """Result of schema validation between new file and existing table."""
-    is_compatible: bool = Field(..., description="Whether schemas are compatible")
+    is_compatible: bool = Field(..., description="Whether schemas are exactly compatible")
+    is_additive_evolution: bool = Field(False, description="True when only additive changes (new cols, safe widenings)")
     match_percentage: float = Field(..., description="Percentage of matching columns")
     matching_columns: List[str] = Field(..., description="Columns present in both")
     missing_columns: List[str] = Field(..., description="Columns in table but not in file")
     extra_columns: List[str] = Field(..., description="Columns in file but not in table")
     discrepancy_report: str = Field(..., description="Human-readable report")
+    type_mismatches: Optional[Dict[str, Any]] = Field(None, description="Type drift details per column")
 
 
 class IncrementalLoadPreview(BaseModel):
@@ -98,8 +100,11 @@ class ApprovalRequest(BaseModel):
 class ProcessingResult(BaseModel):
     """Final processing results."""
     table_name: str = Field(..., description="Final table name used")
-    rows_inserted: int = Field(..., description="Number of rows inserted into database")
+    rows_inserted: int = Field(..., description="Number of rows newly inserted")
+    rows_updated: int = Field(0, description="Number of rows updated via upsert")
     columns: List[str] = Field(..., description="List of column names")
+    columns_added: List[str] = Field(default_factory=list, description="New columns added to the table during this load")
+    schema_changes: List[str] = Field(default_factory=list, description="DDL changes applied (e.g. ALTER TABLE ADD COLUMN)")
     processed_file_path: str = Field(..., description="Path to saved processed CSV file")
     warnings: List[str] = Field(default_factory=list, description="Any warnings during processing")
 

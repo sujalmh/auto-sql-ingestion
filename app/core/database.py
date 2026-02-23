@@ -1,12 +1,40 @@
 import re
 import psycopg2
 from psycopg2 import sql
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_batch, execute_values
 import pandas as pd
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from contextlib import contextmanager
+from datetime import datetime
 from app.config import settings
 from app.core.logger import logger
+
+# Safe type widening order: earlier index = narrower type.
+# A column can only be widened (index moves right), never narrowed automatically.
+_TYPE_WIDENING_ORDER = [
+    "smallint", "integer", "bigint", "numeric", "real", "double precision",
+    "date", "timestamp without time zone", "timestamp with time zone",
+    "character varying", "text"
+]
+
+_WIDENING_GROUPS: Dict[str, List[str]] = {
+    # Integers widen to bigger integers / numeric
+    "smallint": ["integer", "bigint", "numeric", "text"],
+    "integer": ["bigint", "numeric", "text"],
+    "bigint": ["numeric", "text"],
+    "numeric": ["text"],
+    "real": ["double precision", "numeric", "text"],
+    "double precision": ["numeric", "text"],
+    # Date/time hierarchy
+    "date": ["timestamp without time zone", "timestamp with time zone", "text"],
+    "timestamp without time zone": ["timestamp with time zone", "text"],
+    "timestamp with time zone": ["text"],
+    # Varchar / char always widen to text
+    "character varying": ["text"],
+    "character": ["text"],
+    # Boolean can widen to text
+    "boolean": ["text"],
+}
 
 
 class DatabaseManager:
@@ -381,6 +409,274 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error listing tables from metadata: {e}")
             return []
+
+    # ------------------------------------------------------------------
+    # Schema evolution helpers
+    # ------------------------------------------------------------------
+
+    def get_primary_keys(self, table_name: str) -> List[str]:
+        """
+        Return the list of primary-key column names for an existing table.
+        Queries the real PostgreSQL constraint catalogue so the result is always
+        authoritative, regardless of how the table was created.
+
+        Returns an empty list if no PK is defined (caller should fall back
+        to append-only behaviour and log a warning).
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT kcu.column_name
+                        FROM information_schema.table_constraints AS tc
+                        JOIN information_schema.key_column_usage AS kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                         AND tc.table_schema   = kcu.table_schema
+                        WHERE tc.constraint_type = 'PRIMARY KEY'
+                          AND tc.table_schema    = 'public'
+                          AND tc.table_name      = %s
+                        ORDER BY kcu.ordinal_position
+                        """,
+                        (table_name.lower(),)
+                    )
+                    pks = [row[0] for row in cur.fetchall()]
+                    logger.info(f"Primary keys for '{table_name}': {pks}")
+                    return pks
+        except Exception as e:
+            logger.error(f"Error fetching primary keys for '{table_name}': {e}")
+            return []
+
+    def get_table_column_types(self, table_name: str) -> Dict[str, str]:
+        """
+        Return a mapping of {column_name_lowercase: postgres_data_type} for
+        every column in the table.  Uses information_schema for portability.
+        Returns an empty dict if the table does not exist or on error.
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name   = %s
+                        ORDER BY ordinal_position
+                        """,
+                        (table_name.lower(),)
+                    )
+                    result = {row[0].lower(): row[1].lower() for row in cur.fetchall()}
+                    logger.info(f"Fetched {len(result)} column types for '{table_name}'")
+                    return result
+        except Exception as e:
+            logger.error(f"Error fetching column types for '{table_name}': {e}")
+            return {}
+
+    def alter_table_add_columns(
+        self,
+        table_name: str,
+        new_columns: Dict[str, str]  # {col_name: postgres_type}
+    ) -> List[str]:
+        """
+        Add missing columns to an existing table.  New columns are nullable by
+        default so that existing rows receive NULL for the new field.
+
+        Returns the list of column names that were successfully added.
+        """
+        added: List[str] = []
+        if not new_columns:
+            return added
+        safe_table = self._sanitize_identifier(table_name)
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    for col_name, col_type in new_columns.items():
+                        safe_col = self._sanitize_identifier(col_name)
+                        try:
+                            cur.execute(
+                                f"ALTER TABLE {safe_table} ADD COLUMN IF NOT EXISTS {safe_col} {col_type}"
+                            )
+                            added.append(col_name)
+                            logger.info(
+                                f"ALTER TABLE {table_name}: added column '{col_name}' ({col_type})"
+                            )
+                        except Exception as col_err:
+                            logger.warning(
+                                f"Could not add column '{col_name}' to '{table_name}': {col_err}"
+                            )
+        except Exception as e:
+            logger.error(f"Error altering table '{table_name}': {e}")
+        return added
+
+    def alter_column_type_safe(
+        self,
+        table_name: str,
+        col_name: str,
+        new_type: str
+    ) -> bool:
+        """
+        Widen a column's type using ALTER COLUMN … TYPE … USING.
+        Only safe widenings are attempted; the caller is responsible for
+        checking _WIDENING_GROUPS before calling this.
+
+        Returns True on success, False on failure.
+        """
+        safe_table = self._sanitize_identifier(table_name)
+        safe_col   = self._sanitize_identifier(col_name)
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"ALTER TABLE {safe_table} "
+                        f"ALTER COLUMN {safe_col} TYPE {new_type} "
+                        f"USING {safe_col}::{new_type}"
+                    )
+            logger.info(f"Widened '{table_name}'.'{col_name}' to {new_type}")
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Could not widen '{table_name}'.'{col_name}' to {new_type}: {e}"
+            )
+            return False
+
+    def ensure_ingested_at_column(self, table_name: str) -> None:
+        """
+        Add `ingested_at TIMESTAMPTZ` to the table if it doesn't already exist.
+        This column is maintained by the ingestion pipeline as an audit trail.
+        """
+        existing = self.get_table_column_types(table_name)
+        if "ingested_at" not in existing:
+            self.alter_table_add_columns(
+                table_name,
+                {"ingested_at": "TIMESTAMP WITH TIME ZONE"}
+            )
+            logger.info(f"Added 'ingested_at' audit column to '{table_name}'")
+
+    def upsert_data(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        key_columns: List[str],
+        column_types: Optional[Dict[str, str]] = None,
+        batch_size: int = 1000
+    ) -> Tuple[int, int]:
+        """
+        Perform a deterministic UPSERT using INSERT … ON CONFLICT DO UPDATE.
+
+        * On conflict (matching key_columns), all non-key columns are updated.
+        * The `ingested_at` column is always refreshed to NOW().
+        * Running the same data twice is fully idempotent.
+
+        Args:
+            table_name:   Target table (must exist).
+            df:           Aligned DataFrame (columns already match the table).
+            key_columns:  Columns that form the conflict target (PK / unique).
+            column_types: Optional type hints for date normalization.
+            batch_size:   Row batch size for execute_values.
+
+        Returns:
+            Tuple (rows_inserted, rows_updated) — estimated via xmax heuristic.
+        """
+        if df.empty:
+            return 0, 0
+
+        if column_types:
+            df = self._normalize_date_columns(df.copy(), column_types)
+            self._widen_narrow_varchars(table_name, df, column_types)
+
+        # Stamp ingested_at for every row
+        df = df.copy()
+        df["ingested_at"] = datetime.utcnow()
+
+        # Identify columns
+        all_cols = [c for c in df.columns]
+        key_cols_lower = [k.lower() for k in key_columns]
+        update_cols = [c for c in all_cols if c.lower() not in key_cols_lower]
+
+        if not update_cols:
+            logger.warning(
+                f"All columns are key columns for '{table_name}'; "
+                "cannot build ON CONFLICT DO UPDATE. Falling back to INSERT IGNORE."
+            )
+            # Just do INSERT … ON CONFLICT DO NOTHING for identity tables
+            return self._insert_on_conflict_nothing(table_name, df, key_cols_lower, batch_size)
+
+        safe_table   = self._sanitize_identifier(table_name)
+        safe_all     = [self._sanitize_identifier(c) for c in all_cols]
+        safe_keys    = [self._sanitize_identifier(k) for k in key_cols_lower]
+        safe_updates = [self._sanitize_identifier(c) for c in update_cols]
+
+        # Build the conflict target — for PostgreSQL we need quoted identifiers
+        conflict_target = ", ".join(safe_keys)
+        update_set = ", ".join(f"{sc} = EXCLUDED.{sc}" for sc in safe_updates)
+
+        insert_sql = (
+            f"INSERT INTO {safe_table} ({', '.join(safe_all)}) "
+            f"VALUES %s "
+            f"ON CONFLICT ({conflict_target}) DO UPDATE SET {update_set} "
+            f"RETURNING (xmax = 0) AS inserted"
+        )
+
+        rows_data = [tuple(row) for row in df.itertuples(index=False, name=None)]
+
+        inserted_count = 0
+        updated_count  = 0
+
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    for i in range(0, len(rows_data), batch_size):
+                        batch = rows_data[i : i + batch_size]
+                        execute_values(cur, insert_sql, batch)
+                        results = cur.fetchall()
+                        for (was_inserted,) in results:
+                            if was_inserted:
+                                inserted_count += 1
+                            else:
+                                updated_count += 1
+
+            logger.info(
+                f"Upsert into '{table_name}': {inserted_count} inserted, "
+                f"{updated_count} updated"
+            )
+            return inserted_count, updated_count
+
+        except Exception as e:
+            logger.error(f"Error during upsert into '{table_name}': {e}")
+            raise
+
+    def _insert_on_conflict_nothing(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        key_cols_lower: List[str],
+        batch_size: int
+    ) -> Tuple[int, int]:
+        """Fallback: INSERT … ON CONFLICT DO NOTHING (for identity-only tables)."""
+        safe_table = self._sanitize_identifier(table_name)
+        all_cols   = df.columns.tolist()
+        safe_all   = [self._sanitize_identifier(c) for c in all_cols]
+        safe_keys  = [self._sanitize_identifier(k) for k in key_cols_lower]
+        conflict_target = ", ".join(safe_keys)
+
+        insert_sql = (
+            f"INSERT INTO {safe_table} ({', '.join(safe_all)}) "
+            f"VALUES %s ON CONFLICT ({conflict_target}) DO NOTHING"
+        )
+        rows_data = [tuple(row) for row in df.itertuples(index=False, name=None)]
+        inserted = 0
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    for i in range(0, len(rows_data), batch_size):
+                        batch = rows_data[i : i + batch_size]
+                        execute_values(cur, insert_sql, batch)
+                        inserted += cur.rowcount
+        except Exception as e:
+            logger.error(f"Error in insert-on-conflict-nothing for '{table_name}': {e}")
+            raise
+        return inserted, 0
 
     def drop_ingestion_tables_and_metadata(self) -> Dict[str, int]:
         """

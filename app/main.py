@@ -611,63 +611,85 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
             top_match = similar_tables[0]
             matched_table_name = top_match['table_name']
             similarity_score = top_match['similarity_score']
-            
+
             logger.info(f"[Job {job_id}] Top match: {matched_table_name} (similarity: {similarity_score:.2%})")
-            
+
             # Validate schema compatibility
+            # Also fetch actual DB column types for type-drift detection
             logger.info(f"[Job {job_id}] Validating schema compatibility")
             new_columns = processed_df.columns.tolist()
-            
+
+            # Fetch existing table column types for richer comparison
+            existing_db_types = db_manager.get_table_column_types(matched_table_name)
+            new_types_lower = {k.lower(): v for k, v in column_types.items()}
+
             is_compatible, validation_result, report = schema_validator.validate_incremental_load(
                 table_name=matched_table_name,
                 new_columns=new_columns,
-                new_file_name=Path(file_path).name
+                new_file_name=Path(file_path).name,
+                new_types=new_types_lower,
+                existing_types=existing_db_types
             )
-            
-            logger.info(f"[Job {job_id}] Schema validation: compatible={is_compatible}")
+
+            is_additive_evolution = validation_result.get('is_additive_evolution', False)
+            logger.info(
+                f"[Job {job_id}] Schema validation: compatible={is_compatible}, "
+                f"additive_evolution={is_additive_evolution}"
+            )
             logger.info(f"[Job {job_id}] Validation report:\n{report}")
-            
+
             # Store similarity and validation results
             job_manager.set_similarity_results(
                 job_id=job_id,
                 similar_tables=similar_tables,
                 matched_table_name=matched_table_name
             )
-            
+
             job_manager.set_schema_validation(
                 job_id=job_id,
                 schema_validation=validation_result,
                 is_incremental_load=True
             )
-            
+
             # Step 9.5: Detect duplicate data by comparing period values
             logger.info(f"[Job {job_id}] Checking for duplicate data")
             duplicate_result = schema_validator.detect_duplicate_data(
                 table_name=matched_table_name,
                 new_df=processed_df
             )
-            
+
             logger.info(f"[Job {job_id}] Duplicate detection: {duplicate_result['status']}")
             logger.info(f"[Job {job_id}] {duplicate_result['message']}")
-            
+
             # Store duplicate detection results
             job = job_manager.get_job(job_id)
             if job:
                 job.duplicate_detection = duplicate_result
-            
-            # Determine final status based on duplicate detection
+
+            # Determine final status
             if duplicate_result['status'] in ['DUPLICATE', 'PARTIAL_OVERLAP']:
-                # Warn user about duplicate/overlap
+                # Warn user about duplicate/overlap — always requires decision
                 job_manager.update_status(job_id, JobStatus.DUPLICATE_DATA_DETECTED)
                 logger.warning(f"[Job {job_id}] Duplicate/overlap detected. Awaiting user decision.")
-            else:
-                # NEW_DATA or NO_PERIOD_COLUMN - proceed with normal IL approval
+            elif is_compatible or is_additive_evolution:
+                # Exact match OR additive-only evolution — no human approval needed for schema
+                # The user still approves the *data*, but schema changes are auto-handled in IL.
                 job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
-                logger.info(f"[Job {job_id}] Incremental load detected. Awaiting user approval.")
+                logger.info(
+                    f"[Job {job_id}] Incremental load queued. "
+                    f"{'Exact schema match.' if is_compatible else 'Additive schema evolution — new columns will be added automatically.'}"
+                )
+            else:
+                # Genuinely incompatible: columns dropped from CSV or unsafe type changes
+                job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
+                logger.warning(
+                    f"[Job {job_id}] Schema incompatibility detected (destructive changes). "
+                    "Awaiting user approval."
+                )
         else:
             # No similar tables found, proceed with OTL
             logger.info(f"[Job {job_id}] No similar tables found. Proceeding with One-Time Load (OTL).")
-        
+
         # Step 10: Store preprocessing results
         job_manager.set_preprocessing_results(
             job_id=job_id,
@@ -677,17 +699,18 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
             summary=summary,
             llm_metadata=llm_metadata
         )
-        
-        # Update status to AWAITING_APPROVAL if not already set to SCHEMA_MISMATCH
+
+        # Update status to AWAITING_APPROVAL only if not already set to IL/duplicate status
         job = job_manager.get_job(job_id)
-        if job.status != JobStatus.SCHEMA_MISMATCH:
+        il_statuses = {JobStatus.SCHEMA_MISMATCH, JobStatus.DUPLICATE_DATA_DETECTED}
+        if job.status not in il_statuses:
             job_manager.update_status(job_id, JobStatus.AWAITING_APPROVAL)
             logger.info(f"[Job {job_id}] Preprocessing complete. Awaiting user approval for OTL.")
-        
+
         # Disconnect from Milvus
         if milvus_connected:
             milvus_manager.disconnect()
-        
+
         logger.info(f"[Job {job_id}] Preprocessing pipeline complete.")
         
     except Exception as e:
@@ -860,12 +883,14 @@ async def insert_to_database(job_id: str, table_name: str, user_metadata):
 
 async def perform_incremental_load(job_id: str, table_name: str, user_metadata):
     """
-    Background task to perform incremental load (append data to existing table).
-    
-    Args:
-        job_id: Job identifier
-        table_name: Name of the existing table to append to
-        user_metadata: User-provided metadata from approval request
+    Background task: incremental load with schema evolution and UPSERT.
+
+    This task:
+    - Auto-detects primary keys from DB constraints
+    - Evolves the table schema (ADD COLUMN for new fields, safe type widenings)
+    - Performs deterministic UPSERT (INSERT ON CONFLICT DO UPDATE)
+    - Maintains the ingested_at audit column
+    - Returns a rich audit summary
     """
     logger.info(f"[Job {job_id}] Starting incremental load pipeline for table: {table_name}")
     
@@ -873,25 +898,43 @@ async def perform_incremental_load(job_id: str, table_name: str, user_metadata):
         job = job_manager.get_job(job_id)
         if not job or job.processed_df is None:
             raise ValueError("Job data not found or missing processed DataFrame")
-        
-        # Step 1: Perform incremental load
-        logger.info(f"[Job {job_id}] Appending {len(job.processed_df)} rows to {table_name}")
-        
+
+        # Step 1: Perform incremental load with schema evolution + upsert
+        logger.info(
+            f"[Job {job_id}] Running schema-evolving UPSERT for "
+            f"{len(job.processed_df)} rows into '{table_name}'"
+        )
+
         load_summary = incremental_loader.perform_incremental_load(
             table_name=table_name,
             df=job.processed_df,
             column_types=job.column_types,
-            last_available_value=None  # Can be enhanced to track period values
+            key_columns=None,  # auto-detect from DB PK constraints
+            last_available_value=None
         )
-        
+
         if not load_summary['success']:
             raise Exception(f"Incremental load failed: {load_summary.get('error', 'Unknown error')}")
-        
+
+        rows_inserted = load_summary.get('rows_inserted', 0)
+        rows_updated  = load_summary.get('rows_updated', 0)
+        columns_added = load_summary.get('columns_added', [])
+        schema_changes = load_summary.get('schema_changes', [])
+        il_warnings    = load_summary.get('warnings', [])
+
         logger.info(f"[Job {job_id}] Incremental load summary:")
-        logger.info(f"  - Rows before: {load_summary['rows_before']}")
-        logger.info(f"  - Rows added: {load_summary['rows_added']}")
-        logger.info(f"  - Rows after: {load_summary['rows_after']}")
-        
+        logger.info(f"  - Rows before:    {load_summary['rows_before']}")
+        logger.info(f"  - Rows inserted:  {rows_inserted}")
+        logger.info(f"  - Rows updated:   {rows_updated}")
+        logger.info(f"  - Rows after:     {load_summary['rows_after']}")
+        if columns_added:
+            logger.info(f"  - Columns added:  {columns_added}")
+        if schema_changes:
+            logger.info(f"  - Schema changes: {schema_changes}")
+        if il_warnings:
+            for w in il_warnings:
+                logger.warning(f"  [W] {w}")
+
         # Step 2: Save processed data as CSV for record-keeping
         logger.info(f"[Job {job_id}] Saving incremental data as CSV")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -899,19 +942,29 @@ async def perform_incremental_load(job_id: str, table_name: str, user_metadata):
         csv_path = PROCESSED_DIR / csv_filename
         job.processed_df.to_csv(csv_path, index=False)
         logger.info(f"[Job {job_id}] Saved to: {csv_path}")
-        
+
         # Step 3: Update job with completion results
         job_manager.set_completion_results(
             job_id=job_id,
             final_table_name=table_name,
-            rows_inserted=load_summary['rows_added'],
+            rows_inserted=rows_inserted,
             processed_file_path=str(csv_path),
-            warnings=[]
+            warnings=il_warnings
         )
+        # Store extra audit fields on the job object directly
+        completed_job = job_manager.get_job(job_id)
+        if completed_job:
+            completed_job.rows_updated   = rows_updated
+            completed_job.columns_added  = columns_added
+            completed_job.schema_changes = schema_changes
+
         job_manager.update_status(job_id, JobStatus.INCREMENTAL_LOAD_COMPLETED)
-        
-        logger.info(f"[Job {job_id}] Incremental load complete!")
-        
+
+        logger.info(
+            f"[Job {job_id}] Incremental load complete! "
+            f"+{rows_inserted} inserted / +{rows_updated} updated"
+        )
+
     except Exception as e:
         logger.error(f"[Job {job_id}] Incremental load failed: {str(e)}", exc_info=True)
         job_manager.set_error(job_id, f"Incremental load failed: {str(e)}")
