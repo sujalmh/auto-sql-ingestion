@@ -56,6 +56,9 @@ class JobData:
         
         # Error tracking
         self.error: Optional[str] = None
+        
+        # User defined overrides
+        self.table_name: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert job data to dictionary (excluding DataFrame)."""
@@ -116,6 +119,23 @@ class JobManager:
         """
         with self._lock:
             return self._jobs.get(job_id)
+
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Delete a job from memory.
+        
+        Args:
+            job_id: Job identifier
+            
+        Returns:
+            True if job was found and deleted, False otherwise
+        """
+        with self._lock:
+            if job_id in self._jobs:
+                del self._jobs[job_id]
+                logger.info(f"Deleted job {job_id} from memory")
+                return True
+            return False
 
     def clear_all(self) -> int:
         """Clear all jobs from memory. Returns number of jobs cleared."""

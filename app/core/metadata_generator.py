@@ -63,6 +63,7 @@ Dataset Information:
 - Previous Analysis: {analysis.get('domain', 'unknown')}
 
 Based on the table name, columns, and sample data, select the MOST APPROPRIATE domain from the list above.
+The selected domain abbreviation will be used directly in the table name (e.g. IIP, CPI, GDP), so choose the most specific match.
 
 Respond in JSON format:
 {{
@@ -121,6 +122,7 @@ Total Rows: {len(df)}
 The description should:
 - Be 1-2 sentences maximum
 - Describe what data the table contains
+- Mention the geographic scope, time granularity, and data grain where evident (e.g. "India monthly data at sub-category level")
 - Mention the time period if evident
 - Be clear and professional
 

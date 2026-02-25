@@ -84,3 +84,7 @@ tmp/
 # MCP / IDE
 mcps/
 *.lock
+
+# Added directories
+tests/
+output/

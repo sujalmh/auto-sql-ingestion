@@ -709,6 +709,44 @@ class DatabaseManager:
             logger.error(f"Error in drop_ingestion_tables_and_metadata: {e}")
             raise
 
+    def delete_table_and_metadata(self, table_name: str) -> bool:
+        """
+        Drop a specific table from the database and remove its metadata.
+        
+        Args:
+            table_name: Name of the table
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    # Drop the table
+                    cur.execute(
+                        sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
+                            sql.Identifier(table_name)
+                        )
+                    )
+                    logger.info(f"Dropped table: {table_name}")
+                    
+                    # Clear from tables_metadata
+                    cur.execute(
+                        "DELETE FROM tables_metadata WHERE table_name = %s",
+                        (table_name,)
+                    )
+                    
+                    # Clear from operational_metadata
+                    cur.execute(
+                        "DELETE FROM operational_metadata WHERE table_name = %s",
+                        (table_name,)
+                    )
+                    logger.info(f"Cleared metadata for table: {table_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error in delete_table_and_metadata for {table_name}: {e}")
+            return False
+
 
 # Global database manager instance
 db_manager = DatabaseManager()

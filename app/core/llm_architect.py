@@ -64,7 +64,9 @@ Tasks:
    - Pandas MultiIndex columns
    - First few rows containing header information (e.g., "Unit value index" spanning multiple columns)
    - Look for patterns where first rows have duplicate values or many NaN values
-3. Identify the grain/dimensionality of the data (e.g., State-wise, Category-wise, Monthly)
+3. Identify the grain/dimensionality of the data using canonical abbreviations (all lowercase):
+   geo: india, state, dist | time: dly, wk, mth, qtr, yr | grain: catg, sctg, sector, commodity, industry, instrument, scheme, bank
+   Example: "state-mth-catg" for state-wise monthly data with category breakdown.
 4. Suggest preprocessing strategy
 5. data_period: When column names or context indicate a single reference date for the data (e.g. "as on Dec 31, 2025", "for the month of Dec 2025", "December 2025"), extract it and return in Mmm-yyyy format (e.g. "Dec 2025"). Use for the final table so each row has the "time of data". Omit or null if not determinable.
 
@@ -128,18 +130,38 @@ Respond in JSON format:
         logger.info("Generating table name with LLM")
         
         naming_convention = """
-Naming Convention: auto_<domain>_<Geo>_<Time>_<grain-Dimension>
+Naming Convention:  <domain>_<geo>_<time>_<grain_dimension>
+ALL segments MUST be lowercase snake_case.
 
-Examples:
-- auto_IIP_India_Mth_SCtg (IIP India Monthly SubCategory)
-- auto_IIP_State_Mth_Catg (IIP Statewise Monthly Category)
-- auto_IIP_State_Mth_Sector (IIP Statewise Monthly Sector)
+  - <domain>   (mandatory) — data domain. Use well-known abbreviations when they
+                exist (gdp, cpi, iip, gst, msme, fdi, upi, epfo …); otherwise
+                use the full descriptive name in snake_case.
+  - <geo>      (optional)  — geographic level of the data.
+  - <time>     (optional)  — time granularity of the data.
+  - <grain_dimension> (optional) — the lowest-level dimension / grain of rows.
 
-Guidelines:
-- domain: Data domain keep it in full form only unless there exists its short form eg : GDP, CPI, etc.
-- Geo: Geographic level (India, State, District, etc.)
-- Time: Time granularity (Mth=Monthly, Qtr=Quarterly, Yr=Yearly, etc.)
-- grain-Dimension: Data grain/dimension (Catg=Category, SCtg=SubCategory, Sector, etc.)
+Canonical Abbreviation Map (use these consistently, all lowercase):
+  geo   : india, state, dist (district), global, region
+  time  : dly (daily), wk (weekly), mth (monthly), qtr (quarterly), yr (yearly)
+  grain : catg (category), sctg (sub-category), sector, commodity, industry,
+          instrument, scheme, bank, fund, company, product
+
+Examples across domains (all lowercase snake_case):
+  iip_india_mth_sctg        — IIP India Monthly at Sub-Category grain
+  iip_state_mth_catg        — IIP State-wise Monthly at Category grain
+  iip_state_mth_sector      — IIP State-wise Monthly at Sector grain
+  cpi_india_mth_commodity   — CPI India Monthly at Commodity grain
+  cpi_state_yr_catg         — CPI State-wise Yearly at Category grain
+  gdp_india_qtr_sector      — GDP India Quarterly at Sector grain
+  gdp_india_yr_industry     — GDP India Yearly at Industry grain
+  trade_india_mth_commodity — Trade India Monthly at Commodity grain
+  msme_india_yr_industry    — MSME India Yearly at Industry grain
+  gst_state_mth_sector      — GST State-wise Monthly at Sector grain
+  mutual_fund_india_mth_scheme — Mutual Fund India Monthly at Scheme grain
+  fdi_india_yr_sector       — FDI India Yearly at Sector grain
+  upi_india_mth_bank        — UPI India Monthly at Bank grain
+  rainfall_dist_mth         — Rainfall District-wise Monthly (no further grain)
+  epfo_state_mth_industry   — EPFO State-wise Monthly at Industry grain
 """
         
         # Handle MultiIndex columns for JSON serialization
@@ -165,14 +187,15 @@ Data Analysis:
 - Columns: {column_list}
 - Sample rows (first 10): {json.dumps(sample_data, indent=2, default=str)}
 
-Generate an appropriate table name following the convention. The name should be:
-- All lowercase
-- Use underscores to separate parts
-- Be descriptive but concise
+Generate an appropriate table name following the convention strictly.
+The name MUST be all lowercase snake_case (e.g. iip_india_mth_sctg, NOT IIP_India_Mth_SCtg).
+Use the canonical abbreviation map above — do NOT invent your own abbreviations.
+Omit optional segments only when the data truly has no geographic, temporal,
+or dimensional breakdown.
 
 Respond in JSON format:
 {{
-    "table_name": "auto_<domain>_<geo>_<time>_<grain-Dimension>",
+    "table_name": "<domain>_<geo>_<time>_<grain_dimension>",
     "reasoning": "brief explanation of the naming choice"
 }}"""
         
@@ -180,7 +203,7 @@ Respond in JSON format:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a database naming expert. Generate table names following strict naming conventions."},
+                    {"role": "system", "content": "You are a database naming expert specializing in Indian economic and statistical datasets. Generate table names following strict naming conventions and canonical abbreviations."},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
@@ -360,18 +383,24 @@ Respond with ONLY a single number: 1, 2, or 3"""
             return table_name
         logger.info(f"Refining long table name: {table_name}")
         try:
-            prompt = f"""Shorten this table name to max 40 characters.
+            prompt = f"""Shorten this table name to max 40 characters while preserving the
+naming convention: <domain>_<geo>_<time>_<grain_dimension>.
+The result MUST be all lowercase snake_case.
 
 Original: {table_name}
 
-Rules:
-- Keep domain (monetary, trade, gdp)
-- Keep geography (india)
-- Keep time grain (yr, qtr, mth)
-- Use underscores, lowercase
-- Economics context
+Use these canonical abbreviations (all lowercase):
+  geo  : india, state, dist
+  time : dly, wk, mth, qtr, yr
+  grain: catg, sctg, sector, commodity, industry, instrument, scheme, bank
 
-Return ONLY the shortened name."""
+Rules:
+- Keep all four segments if possible; shorten individual words using the map above
+- Use underscores between segments
+- Preserve the domain abbreviation exactly as-is (gdp, cpi, iip, etc.)
+- Output MUST be all lowercase
+
+Return ONLY the shortened name, nothing else."""
             
             response = self.client.chat.completions.create(
                 model=self.model,

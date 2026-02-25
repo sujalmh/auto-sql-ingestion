@@ -301,6 +301,71 @@ async def export_job_data(job_id: str, format: str = "csv"):
     raise HTTPException(status_code=400, detail="format must be 'csv' or 'json'")
 
 
+@app.delete("/job/{job_id}")
+async def delete_job(job_id: str):
+    """
+    Completely delete all information associated with a job from disk and database.
+    """
+    logger.info(f"Deletion request for job: {job_id}")
+    
+    job = job_manager.get_job(job_id)
+    if not job:
+        logger.warning(f"Job not found for deletion: {job_id}")
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    deleted_items = []
+    errors = []
+
+    # 1. Delete original uploaded file
+    try:
+        if job.file_path:
+            file_path = Path(job.file_path)
+            if file_path.exists():
+                file_path.unlink()
+                deleted_items.append(f"Uploaded file: {file_path.name}")
+    except Exception as e:
+        errors.append(f"Error deleting uploaded file: {str(e)}")
+
+    # 2. Delete processed CSV file (handle partial completion via globbing)
+    try:
+        table_name_to_clean = job.final_table_name or job.table_name or job.proposed_table_name
+        
+        # Exact match if it exists
+        if job.processed_file_path:
+            process_path = Path(job.processed_file_path)
+            if process_path.exists():
+                process_path.unlink()
+                deleted_items.append(f"Processed file: {process_path.name}")
+                
+        # Search for dangling/partial files matching table name
+        if table_name_to_clean:
+            for p in PROCESSED_DIR.glob(f"*_{table_name_to_clean}*.csv"):
+                p.unlink()
+                deleted_items.append(f"Processed file (partial): {p.name}")
+    except Exception as e:
+        errors.append(f"Error deleting processed file: {str(e)}")
+
+    # 3. Delete database table and metadata
+    try:
+        table_name = job.final_table_name or job.table_name or job.proposed_table_name
+        if table_name:
+            if db_manager.delete_table_and_metadata(table_name):
+                deleted_items.append(f"Database table & metadata: {table_name}")
+            else:
+                errors.append(f"Could not completely delete DB records for {table_name}")
+    except Exception as e:
+        errors.append(f"Error deleting database records: {str(e)}")
+
+    # 4. Remove job from memory
+    if job_manager.delete_job(job_id):
+        deleted_items.append(f"In-memory job record: {job_id}")
+
+    if errors:
+        return {"message": "Job deleted with some errors", "deleted": deleted_items, "errors": errors}
+    
+    return {"message": "Job completely deleted", "deleted": deleted_items}
+
+
 @app.post("/approve/{job_id}")
 async def approve_job(
     job_id: str,
@@ -363,6 +428,10 @@ async def approve_job(
     final_table_name = table_name or job.proposed_table_name
     # Ensure table name is lowercase for PostgreSQL consistency
     final_table_name = final_table_name.lower()
+    
+    # Save the target table name immediately for partial completion cleanup
+    job.table_name = final_table_name
+    
     logger.info(f"Job {job_id} approved with table name: {final_table_name}")
     
     # Update status to approved
@@ -445,7 +514,53 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
         
         # Load first 5 rows without assuming header structure
         if file_path.endswith('.csv'):
-            df_preview = pd.read_csv(file_path, header=None, nrows=5)
+            # Robust CSV delimiter detection.
+            # 1. Check for an explicit "sep=X" metadata directive on line 1
+            #    (used by RBI and some other data portals, e.g. "sep=|").
+            # 2. Fall back to a column-count consistency scorer across lines.
+            detected_delimiter = ','
+            skip_rows = 0
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    first_line = f.readline().rstrip('\n').rstrip('\r')
+                    raw_lines = [first_line] + [f.readline() for _ in range(19)]
+                raw_lines = [l for l in raw_lines if l.strip()]
+
+                # Check for explicit "sep=X" directive (case-insensitive)
+                if first_line.lower().startswith('sep=') and len(first_line.strip()) <= 6:
+                    detected_delimiter = first_line.strip()[4:]  # char after "sep="
+                    skip_rows = 1
+                    logger.info(
+                        f"[Job {job_id}] Found 'sep=' directive, delimiter={repr(detected_delimiter)}, skipping row 1"
+                    )
+                else:
+                    # Consistency-based scoring: pick the delimiter whose column
+                    # count is most stable (lowest variance) across lines.
+                    def _delimiter_score(delim):
+                        counts = [len(line.split(delim)) for line in raw_lines]
+                        if not counts:
+                            return 0, 0
+                        avg = sum(counts) / len(counts)
+                        if avg <= 1:
+                            return 0, 0
+                        variance = sum((c - avg) ** 2 for c in counts) / len(counts)
+                        return avg / (1 + variance), avg
+
+                    candidates = [',', '|', '\t', ';', ':']
+                    best_delim, best_score = ',', -1
+                    for delim in candidates:
+                        score, _ = _delimiter_score(delim)
+                        if score > best_score:
+                            best_score = score
+                            best_delim = delim
+                    detected_delimiter = best_delim
+                    logger.info(f"[Job {job_id}] Detected CSV delimiter: {repr(detected_delimiter)}")
+            except Exception as e:
+                logger.warning(f"[Job {job_id}] Could not detect delimiter, defaulting to comma: {e}")
+
+            df_preview = pd.read_csv(
+                file_path, header=None, nrows=5, sep=detected_delimiter, skiprows=skip_rows
+            )
         else:
             df_preview = pd.read_excel(file_path, header=None, nrows=5)
         
@@ -457,19 +572,19 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
         if header_count == 1:
             # Single header row
             if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
+                df = pd.read_csv(file_path, sep=detected_delimiter, skiprows=skip_rows)
             else:
                 df = pd.read_excel(file_path)
         elif header_count == 2:
             # Two header rows
             if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path, header=[0, 1])
+                df = pd.read_csv(file_path, header=[0, 1], sep=detected_delimiter, skiprows=skip_rows)
             else:
                 df = pd.read_excel(file_path, header=[0, 1])
         else:  # header_count == 3
             # Three header rows
             if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path, header=[0, 1, 2])
+                df = pd.read_csv(file_path, header=[0, 1, 2], sep=detected_delimiter, skiprows=skip_rows)
             else:
                 df = pd.read_excel(file_path, header=[0, 1, 2])
         
@@ -667,24 +782,43 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
                 job.duplicate_detection = duplicate_result
 
             # Determine final status
-            if duplicate_result['status'] in ['DUPLICATE', 'PARTIAL_OVERLAP']:
-                # Warn user about duplicate/overlap — always requires decision
+            #
+            # UPSERT handles duplicates natively (ON CONFLICT DO UPDATE), so
+            # duplicate data should NOT block the incremental load.  It is only
+            # informational.  We still attach the duplicate_result on the job
+            # so the user can see it, but we route to SCHEMA_MISMATCH (= IL
+            # approval) in all cases except a pure exact re-upload with zero
+            # schema changes — that one is flagged as DUPLICATE_DATA_DETECTED
+            # so the user knows nothing new will happen.
+
+            has_schema_changes = not is_compatible  # extra cols, missing cols, or type drift
+            is_full_duplicate  = duplicate_result['status'] == 'DUPLICATE'
+
+            if is_full_duplicate and not has_schema_changes:
+                # Pure re-upload: identical data AND identical schema — warn user
                 job_manager.update_status(job_id, JobStatus.DUPLICATE_DATA_DETECTED)
-                logger.warning(f"[Job {job_id}] Duplicate/overlap detected. Awaiting user decision.")
-            elif is_compatible or is_additive_evolution:
-                # Exact match OR additive-only evolution — no human approval needed for schema
-                # The user still approves the *data*, but schema changes are auto-handled in IL.
-                job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
-                logger.info(
-                    f"[Job {job_id}] Incremental load queued. "
-                    f"{'Exact schema match.' if is_compatible else 'Additive schema evolution — new columns will be added automatically.'}"
+                logger.warning(
+                    f"[Job {job_id}] Exact duplicate detected (same data + same schema). "
+                    "Nothing new to load. Awaiting user decision."
                 )
             else:
-                # Genuinely incompatible: columns dropped from CSV or unsafe type changes
+                # Route to IL approval — UPSERT will handle any overlapping rows,
+                # and schema evolution will handle new/changed columns
                 job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
-                logger.warning(
-                    f"[Job {job_id}] Schema incompatibility detected (destructive changes). "
-                    "Awaiting user approval."
+
+                # Build informational log message
+                parts = []
+                if duplicate_result['status'] in ['DUPLICATE', 'PARTIAL_OVERLAP']:
+                    parts.append(f"duplicate/overlap detected (UPSERT will handle)")
+                if is_compatible:
+                    parts.append("exact schema match")
+                elif is_additive_evolution:
+                    parts.append("additive schema evolution — new columns will be added automatically")
+                else:
+                    parts.append("schema differences require review")
+
+                logger.info(
+                    f"[Job {job_id}] Incremental load queued: {'; '.join(parts)}."
                 )
         else:
             # No similar tables found, proceed with OTL
