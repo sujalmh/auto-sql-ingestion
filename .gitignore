@@ -88,3 +88,16 @@ mcps/
 # Added directories
 tests/
 output/
+
+# Runtime / scratch dev files
+API_USAGE_EXAMPLES.md
+METADATA_INSERTION_CODE.txt
+MULTILEVEL_HEADERS.md
+NEW_INSERT_FUNCTION.py
+create_sample_multilevel.py
+test_deletion_flow.py
+
+# Any .pyc / pycache anywhere (belt-and-suspenders)
+**/__pycache__/
+**/*.pyc
+**/*.pyo
