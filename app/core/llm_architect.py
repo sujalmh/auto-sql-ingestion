@@ -115,7 +115,7 @@ Respond in JSON format:
                 "data_period": None,
             }
     
-    def generate_table_name(self, df: pd.DataFrame, analysis: Dict, file_description: str = None) -> str:
+    def generate_table_name(self, df: pd.DataFrame, analysis: Dict, file_description: str = None, filename: str = None) -> str:
         """
         Generate a PostgreSQL table name based on file analysis.
         
@@ -123,6 +123,7 @@ Respond in JSON format:
             df: DataFrame to analyze
             analysis: Analysis results from analyze_file_structure
             file_description: Optional user-provided description to help with naming
+            filename: Original filename (without extension) for additional context
             
         Returns:
             Generated table name
@@ -133,9 +134,12 @@ Respond in JSON format:
 Naming Convention:  <domain>_<geo>_<time>_<grain_dimension>
 ALL segments MUST be lowercase snake_case.
 
-  - <domain>   (mandatory) — data domain. Use well-known abbreviations when they
-                exist (gdp, cpi, iip, gst, msme, fdi, upi, epfo …); otherwise
-                use the full descriptive name in snake_case.
+  - <domain>   (mandatory) — the SPECIFIC dataset or indicator name, NOT a
+                generic category.  Use well-known abbreviations when they exist
+                (gdp, cpi, iip, gst, msme, fdi, upi, epfo, wpi, rbi_credit,
+                bank_deposits, money_supply, forex_reserves, fiscal_deficit …);
+                otherwise use the full descriptive name in snake_case.
+                MUST uniquely identify WHAT the data is about.
   - <geo>      (optional)  — geographic level of the data.
   - <time>     (optional)  — time granularity of the data.
   - <grain_dimension> (optional) — the lowest-level dimension / grain of rows.
@@ -146,22 +150,32 @@ Canonical Abbreviation Map (use these consistently, all lowercase):
   grain : catg (category), sctg (sub-category), sector, commodity, industry,
           instrument, scheme, bank, fund, company, product
 
-Examples across domains (all lowercase snake_case):
-  iip_india_mth_sctg        — IIP India Monthly at Sub-Category grain
-  iip_state_mth_catg        — IIP State-wise Monthly at Category grain
-  iip_state_mth_sector      — IIP State-wise Monthly at Sector grain
-  cpi_india_mth_commodity   — CPI India Monthly at Commodity grain
-  cpi_state_yr_catg         — CPI State-wise Yearly at Category grain
-  gdp_india_qtr_sector      — GDP India Quarterly at Sector grain
-  gdp_india_yr_industry     — GDP India Yearly at Industry grain
-  trade_india_mth_commodity — Trade India Monthly at Commodity grain
-  msme_india_yr_industry    — MSME India Yearly at Industry grain
-  gst_state_mth_sector      — GST State-wise Monthly at Sector grain
-  mutual_fund_india_mth_scheme — Mutual Fund India Monthly at Scheme grain
-  fdi_india_yr_sector       — FDI India Yearly at Sector grain
-  upi_india_mth_bank        — UPI India Monthly at Bank grain
-  rainfall_dist_mth         — Rainfall District-wise Monthly (no further grain)
-  epfo_state_mth_industry   — EPFO State-wise Monthly at Industry grain
+─── GOOD examples (specific, self-explanatory) ───
+  iip_india_mth_sctg              — IIP India Monthly at Sub-Category grain
+  cpi_india_mth_commodity         — CPI India Monthly at Commodity grain
+  gdp_india_qtr_sector            — GDP India Quarterly at Sector grain
+  bank_credit_india_mth           — Bank Credit India Monthly
+  mutual_fund_india_mth_scheme    — Mutual Fund India Monthly at Scheme grain
+  money_supply_india_wk           — Money Supply India Weekly
+  forex_reserves_india_wk         — Forex Reserves India Weekly
+  scheduled_bank_deposits_india_mth — Scheduled Commercial Bank Deposits
+  rbi_policy_rate_india_mth       — RBI Policy Rate India Monthly
+  epfo_state_mth_industry         — EPFO State Monthly at Industry grain
+  rainfall_dist_mth               — Rainfall District-wise Monthly
+  trade_india_mth_commodity       — Trade India Monthly at Commodity grain
+  gst_state_mth_sector            — GST State-wise Monthly at Sector grain
+  fiscal_deficit_india_mth        — Fiscal Deficit India Monthly
+  insurance_premium_india_yr_catg — Insurance Premium India Yearly at Category
+
+─── BAD examples (vague, never produce these) ───
+  data_india_yr           ❌  "data" is meaningless
+  finance_india_mth       ❌  "finance" is too broad
+  economic_data_yr        ❌  "economic_data" is generic
+  statistics_india_mth    ❌  "statistics" says nothing
+  rbi_data_india          ❌  "rbi_data" is vague
+  table_india_mth         ❌  "table" is not a domain
+  india_monthly_data      ❌  missing specific domain
+  banking_india_mth       ❌  "banking" too broad — use specific like bank_credit, bank_deposits etc.
 """
         
         # Handle MultiIndex columns for JSON serialization
@@ -172,26 +186,34 @@ Examples across domains (all lowercase snake_case):
         sample_data = df_for_analysis.head(10).to_dict(orient='records')
         column_list = df.columns.tolist() if not isinstance(df.columns, pd.MultiIndex) else [str(col) for col in df.columns]
         
-        # Build prompt with optional file description
-        description_context = ""
+        # Build optional context sections
+        extra_context = ""
         if file_description:
-            description_context = f"\n\nUser-provided context: {file_description}\nUse this to better understand the data and generate a more meaningful table name."
+            extra_context += f"\nUser-provided context: {file_description}"
+        if filename:
+            extra_context += f"\nOriginal filename: {filename}"
+        if extra_context:
+            extra_context = "\n" + extra_context + "\nUse these clues to identify the specific dataset and generate a precise name.\n"
         
         prompt = f"""Generate a PostgreSQL table name following the naming convention.
 
-{naming_convention}{description_context}
-
+{naming_convention}{extra_context}
 Data Analysis:
 - Domain: {analysis.get('domain', 'unknown')}
 - Data Grain: {analysis.get('data_grain', 'unknown')}
 - Columns: {column_list}
 - Sample rows (first 10): {json.dumps(sample_data, indent=2, default=str)}
 
-Generate an appropriate table name following the convention strictly.
-The name MUST be all lowercase snake_case (e.g. iip_india_mth_sctg, NOT IIP_India_Mth_SCtg).
-Use the canonical abbreviation map above — do NOT invent your own abbreviations.
-Omit optional segments only when the data truly has no geographic, temporal,
-or dimensional breakdown.
+CRITICAL RULES:
+1. The <domain> segment MUST specifically identify the dataset — NOT a generic
+   category.  Look at the column names, sample values, and filename to determine
+   exactly what indicator/metric this data represents.
+2. The name MUST be all lowercase snake_case.
+3. Use the canonical abbreviation map — do NOT invent your own abbreviations.
+4. Omit optional segments only when the data truly has no geographic, temporal,
+   or dimensional breakdown.
+5. A good table name should let someone understand what data is in the table
+   WITHOUT looking at the data itself.
 
 Respond in JSON format:
 {{
@@ -203,7 +225,7 @@ Respond in JSON format:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a database naming expert specializing in Indian economic and statistical datasets. Generate table names following strict naming conventions and canonical abbreviations."},
+                    {"role": "system", "content": "You are a database naming expert specializing in Indian economic and statistical datasets. Generate table names that are concise yet specific and self-explanatory. The domain segment must identify the exact dataset, not a generic category."},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
@@ -211,15 +233,21 @@ Respond in JSON format:
             )
             
             result = json.loads(response.choices[0].message.content)
-            table_name = result.get("table_name", "DATA_TABLE")
+            table_name = result.get("table_name", "unknown_dataset").lower()
             reasoning = result.get("reasoning", "")
             
             logger.info(f"Generated table name: {table_name} (Reasoning: {reasoning})")
+            
+            # Post-generation validation: reject vague/generic names
+            table_name = self._validate_table_name(
+                table_name, df_for_analysis, analysis, column_list,
+                file_description, filename
+            )
             return table_name
             
         except Exception as e:
             logger.error(f"Error generating table name: {str(e)}")
-            return "DATA_TABLE_DEFAULT"
+            return "unknown_dataset"
     
     def infer_column_types(self, df: pd.DataFrame) -> Dict[str, str]:
         """
@@ -377,6 +405,66 @@ Respond with ONLY a single number: 1, 2, or 3"""
             logger.error(f"Error detecting headers: {str(e)}, defaulting to 1")
             return 1
     
+    def _validate_table_name(
+        self, table_name: str, df, analysis: Dict, column_list: list,
+        file_description: str = None, filename: str = None
+    ) -> str:
+        """
+        Check if a generated table name is too generic. If so, re-prompt once
+        with stronger instructions to produce a specific name.
+        """
+        vague_words = {
+            'data', 'table', 'file', 'info', 'information', 'dataset',
+            'statistics', 'economic_data', 'finance', 'banking', 'report',
+        }
+        domain_segment = table_name.split('_')[0] if '_' in table_name else table_name
+        # Also check first two segments joined (e.g., 'economic_data')
+        first_two = '_'.join(table_name.split('_')[:2]) if '_' in table_name else table_name
+
+        is_vague = domain_segment in vague_words or first_two in vague_words
+
+        if not is_vague:
+            return table_name
+
+        logger.warning(f"Table name '{table_name}' is too generic — re-prompting LLM")
+
+        extra_context = ""
+        if file_description:
+            extra_context += f"\nUser context: {file_description}"
+        if filename:
+            extra_context += f"\nFilename: {filename}"
+
+        retry_prompt = f"""The table name "{table_name}" is too vague and generic.
+It must specifically identify the dataset/indicator — NOT a broad category.
+
+Look at these clues to determine the EXACT dataset:
+- Columns: {column_list[:15]}
+- Domain from analysis: {analysis.get('domain', 'unknown')}
+- Data grain: {analysis.get('data_grain', 'unknown')}{extra_context}
+
+Examples of SPECIFIC names: bank_credit_india_mth, cpi_india_mth_commodity,
+forex_reserves_india_wk, money_supply_india_wk, fiscal_deficit_india_mth.
+
+Return JSON: {{"table_name": "...", "reasoning": "..."}}"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a database naming expert. The previous name was too generic. Generate a specific, self-explanatory table name."},
+                    {"role": "user", "content": retry_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            result = json.loads(response.choices[0].message.content)
+            refined = result.get("table_name", table_name).lower()
+            logger.info(f"Re-prompted table name: {refined} (was: {table_name})")
+            return refined
+        except Exception as e:
+            logger.error(f"Retry table name generation failed: {str(e)}")
+            return table_name
+
     def refine_table_name(self, table_name: str) -> str:
         """Shorten table name if too long."""
         if len(table_name) <= 40:

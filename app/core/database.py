@@ -368,7 +368,7 @@ class DatabaseManager:
             return False
     
     def insert_operational_metadata(self, metadata: Dict) -> bool:
-        """Insert metadata record into operational_metadata table."""
+        """Insert/update metadata record into operational_metadata table."""
         logger.info(f"Inserting operational metadata for table '{metadata.get('table_name')}'")
         
         try:
@@ -378,6 +378,20 @@ class DatabaseManager:
                     last_available_value, last_updated_on, rows_count, columns,
                     source_url, business_metadata, major_domain, sub_domain, brief_summary
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (table_name)
+                DO UPDATE SET
+                    table_view = COALESCE(EXCLUDED.table_view, operational_metadata.table_view),
+                    period_cols = COALESCE(EXCLUDED.period_cols, operational_metadata.period_cols),
+                    first_available_value = COALESCE(EXCLUDED.first_available_value, operational_metadata.first_available_value),
+                    last_available_value = COALESCE(EXCLUDED.last_available_value, operational_metadata.last_available_value),
+                    last_updated_on = COALESCE(EXCLUDED.last_updated_on, operational_metadata.last_updated_on),
+                    rows_count = COALESCE(EXCLUDED.rows_count, operational_metadata.rows_count),
+                    columns = COALESCE(EXCLUDED.columns, operational_metadata.columns),
+                    source_url = COALESCE(EXCLUDED.source_url, operational_metadata.source_url),
+                    business_metadata = COALESCE(EXCLUDED.business_metadata, operational_metadata.business_metadata),
+                    major_domain = COALESCE(EXCLUDED.major_domain, operational_metadata.major_domain),
+                    sub_domain = COALESCE(EXCLUDED.sub_domain, operational_metadata.sub_domain),
+                    brief_summary = COALESCE(EXCLUDED.brief_summary, operational_metadata.brief_summary)
             """
             
             values = (

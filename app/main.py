@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Optional
+import asyncio
 import pandas as pd
 import shutil
 from datetime import datetime
@@ -50,6 +51,11 @@ STATIC_DIR = Path(__file__).parent.parent / "static"
 UPLOAD_DIR.mkdir(exist_ok=True)
 PROCESSED_DIR.mkdir(exist_ok=True)
 
+# Serialization lock: ensures only one preprocess_file runs at a time.
+# This is critical for peer-job matching in batch uploads — file B must
+# wait for file A to finish so it can detect A as a peer match.
+_preprocess_lock = asyncio.Lock()
+
 # Mount static files for web UI
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -88,7 +94,10 @@ async def clear_jobs():
 async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    file_description: str = None
+    file_description: Optional[str] = Form(None),
+    table_name: Optional[str] = Form(None),
+    skip_llm_table_name: bool = Form(False),
+    sql_mode: Optional[str] = Form(None),
 ):
     """
     Upload a CSV or Excel file for processing.
@@ -101,7 +110,26 @@ async def upload_file(
     The file will be analyzed and preprocessed. Once ready, you'll receive
     a preview that requires approval before database insertion.
     """
-    logger.info(f"Received file upload: {file.filename}")
+    normalized_sql_mode = (sql_mode or "").strip().lower()
+    logger.info(
+        f"Received file upload: {file.filename}; sql_mode={normalized_sql_mode or 'none'}; "
+        f"table_name={table_name or 'none'}; skip_llm_table_name={skip_llm_table_name}"
+    )
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    if skip_llm_table_name and table_name and normalized_sql_mode not in ("otl", "inc"):
+        raise HTTPException(
+            status_code=400,
+            detail="sql_mode ('otl' or 'inc') is required when table_name override is used.",
+        )
+
+    if normalized_sql_mode in ("otl", "inc") and not table_name:
+        raise HTTPException(
+            status_code=400,
+            detail="table_name is required when sql_mode is 'otl' or 'inc'.",
+        )
     
     # Validate file extension
     file_ext = Path(file.filename).suffix.lower()
@@ -127,7 +155,15 @@ async def upload_file(
         job_id = job_manager.create_job(str(file_path))
         
         # Start preprocessing in background
-        background_tasks.add_task(preprocess_file, job_id, str(file_path), file_description)
+        background_tasks.add_task(
+            preprocess_file,
+            job_id,
+            str(file_path),
+            file_description,
+            table_name,
+            skip_llm_table_name,
+            normalized_sql_mode,
+        )
         
         return UploadResponse(
             job_id=job_id,
@@ -439,6 +475,28 @@ async def approve_job(
     
     # Route to OTL or IL based on job status
     if job.is_incremental_load and job.matched_table_name:
+        # Peer-job guard: if this IL was matched against a peer job that hasn't
+        # been committed yet, block and tell the user to approve the OTL first.
+        if job.peer_anchor_job_id:
+            anchor_job = job_manager.get_job(job.peer_anchor_job_id)
+            if anchor_job and anchor_job.status not in (
+                JobStatus.COMPLETED,
+                JobStatus.INCREMENTAL_LOAD_COMPLETED,
+            ):
+                anchor_desc = (
+                    anchor_job.proposed_table_name
+                    or Path(anchor_job.file_path).stem
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This incremental load targets table '{job.matched_table_name}' "
+                        f"from a batch peer job (job {job.peer_anchor_job_id[:8]}... "
+                        f"- '{anchor_desc}') that hasn't been approved yet. "
+                        f"Please approve the OTL job first, then approve this one."
+                    ),
+                )
+
         # Incremental Load workflow
         logger.info(f"Job {job_id} approved for incremental load to table: {job.matched_table_name}")
         background_tasks.add_task(perform_incremental_load, job_id, job.matched_table_name, metadata)
@@ -497,16 +555,53 @@ async def reject_job(job_id: str):
 
 # Background task functions
 
-async def preprocess_file(job_id: str, file_path: str, file_description: str = None):
+async def preprocess_file(
+    job_id: str,
+    file_path: str,
+    file_description: Optional[str] = None,
+    table_name_override: Optional[str] = None,
+    skip_llm_table_name: bool = False,
+    sql_mode: Optional[str] = None,
+):
     """
     Background task to preprocess the uploaded file.
+    
+    Serialized via _preprocess_lock so that batch uploads are processed
+    one at a time, enabling peer-job detection within the same batch.
     
     Args:
         job_id: Job identifier
         file_path: Path to uploaded file
         file_description: Optional user-provided description to help with table naming
     """
+    async with _preprocess_lock:
+        await _preprocess_file_inner(
+            job_id,
+            file_path,
+            file_description,
+            table_name_override,
+            skip_llm_table_name,
+            sql_mode,
+        )
+
+
+async def _preprocess_file_inner(
+    job_id: str,
+    file_path: str,
+    file_description: Optional[str] = None,
+    table_name_override: Optional[str] = None,
+    skip_llm_table_name: bool = False,
+    sql_mode: Optional[str] = None,
+): 
     logger.info(f"[Job {job_id}] Starting preprocessing pipeline")
+    normalized_sql_mode = (sql_mode or "").strip().lower()
+    if normalized_sql_mode in ("otl", "inc") and table_name_override:
+        skip_llm_table_name = True
+    logger.info(
+        f"[Job {job_id}] Routing controls: sql_mode={normalized_sql_mode or 'none'}, "
+        f"table_name_override={table_name_override or 'none'}, "
+        f"skip_llm_table_name={skip_llm_table_name}"
+    )
     
     try:
         # Step 1: Smart header detection
@@ -599,13 +694,18 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
         classification = category_classifier.classify(df, analysis)
         data_category = classification.get("category", 1)
         
-        # Step 3: Generate table name with LLM
-        logger.info(f"[Job {job_id}] Generating table name with LLM")
-        table_name = llm_architect.generate_table_name(df, analysis, file_description)
-        
-        # Step 3b: Refine table name if too long
-        table_name = llm_architect.refine_table_name(table_name)
-        logger.info(f"[Job {job_id}] Final table name: {table_name}")
+        # Step 3: Determine table name
+        if skip_llm_table_name and table_name_override:
+            logger.info(f"[Job {job_id}] Skipping LLM table-name generation due to manual override")
+            table_name = table_name_override.strip().lower().replace(" ", "_")
+            logger.info(f"[Job {job_id}] Using manual table name: {table_name}")
+        else:
+            logger.info(f"[Job {job_id}] Generating table name with LLM")
+            table_name = llm_architect.generate_table_name(df, analysis, file_description, filename=Path(file_path).stem)
+
+            # Step 3b: Refine table name if too long
+            table_name = llm_architect.refine_table_name(table_name)
+            logger.info(f"[Job {job_id}] Final table name: {table_name}")
         
         # Step 4: Preprocess data
         logger.info(f"[Job {job_id}] Preprocessing data")
@@ -721,7 +821,99 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
             logger.error(f"[Job {job_id}] Milvus search failed: {str(e)}, proceeding with OTL")
         
         # Step 9: Decide between OTL and IL
-        if similar_tables and len(similar_tables) > 0:
+        matched_table_name = ""
+        validation_result = {}
+        report = ""
+        is_compatible = False
+        is_additive_evolution = False
+        manual_inc_target = normalized_sql_mode == "inc" and bool(table_name_override)
+
+        manual_inc_handled = False
+
+        if manual_inc_target:
+            target_table = str(table_name_override).strip().lower().replace(" ", "_")
+            logger.info(
+                f"[Job {job_id}] Manual INC mode selected. Forcing incremental target table: {target_table}"
+            )
+
+            new_columns = processed_df.columns.tolist()
+            existing_db_types = db_manager.get_table_column_types(target_table)
+            if not existing_db_types:
+                raise ValueError(
+                    f"Manual INC requested for '{target_table}', but target table does not exist."
+                )
+
+            new_types_lower = {k.lower(): v for k, v in column_types.items()}
+            is_compatible, validation_result, report = schema_validator.validate_incremental_load(
+                table_name=target_table,
+                new_columns=new_columns,
+                new_file_name=Path(file_path).name,
+                new_types=new_types_lower,
+                existing_types=existing_db_types,
+            )
+            is_additive_evolution = validation_result.get("is_additive_evolution", False)
+            logger.info(
+                f"[Job {job_id}] Manual INC schema validation: compatible={is_compatible}, "
+                f"additive_evolution={is_additive_evolution}"
+            )
+            logger.info(f"[Job {job_id}] Manual INC validation report:\n{report}")
+
+            similar_tables = [{
+                "table_name": target_table,
+                "similarity_score": 1.0,
+                "created_at": "",
+                "match_source": "manual_inc",
+            }]
+
+            job_manager.set_similarity_results(
+                job_id=job_id,
+                similar_tables=similar_tables,
+                matched_table_name=target_table,
+            )
+            job_manager.set_schema_validation(
+                job_id=job_id,
+                schema_validation=validation_result,
+                is_incremental_load=True,
+            )
+
+            logger.info(f"[Job {job_id}] Checking for duplicate data")
+            duplicate_result = schema_validator.detect_duplicate_data(
+                table_name=target_table,
+                new_df=processed_df,
+            )
+            logger.info(f"[Job {job_id}] Duplicate detection: {duplicate_result['status']}")
+            logger.info(f"[Job {job_id}] {duplicate_result['message']}")
+
+            job = job_manager.get_job(job_id)
+            if job:
+                job.duplicate_detection = duplicate_result
+
+            has_schema_changes = not is_compatible
+            is_full_duplicate = duplicate_result["status"] == "DUPLICATE"
+
+            if is_full_duplicate and not has_schema_changes:
+                job_manager.update_status(job_id, JobStatus.DUPLICATE_DATA_DETECTED)
+                logger.warning(
+                    f"[Job {job_id}] Exact duplicate detected for manual INC target '{target_table}'. "
+                    "Nothing new to load. Awaiting user decision."
+                )
+            else:
+                job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
+                parts = []
+                if duplicate_result["status"] in ["DUPLICATE", "PARTIAL_OVERLAP"]:
+                    parts.append("duplicate/overlap detected (UPSERT will handle)")
+                if is_compatible:
+                    parts.append("exact schema match")
+                elif is_additive_evolution:
+                    parts.append("additive schema evolution — new columns will be added automatically")
+                else:
+                    parts.append("schema differences require review")
+                logger.info(
+                    f"[Job {job_id}] Manual INC queued for table '{target_table}': {'; '.join(parts)}."
+                )
+            manual_inc_handled = True
+
+        elif similar_tables and len(similar_tables) > 0:
             # Take the top match
             top_match = similar_tables[0]
             matched_table_name = top_match['table_name']
@@ -783,7 +975,9 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
                     similar_tables = []  # discard match — fall through to OTL path below
 
         # Re-check after potential guard rejection
-        if similar_tables and len(similar_tables) > 0:
+        if manual_inc_handled:
+            pass
+        elif similar_tables and len(similar_tables) > 0:
             logger.info(
                 f"[Job {job_id}] Schema validation: compatible={is_compatible}, "
                 f"additive_evolution={is_additive_evolution}"
@@ -858,8 +1052,263 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
                     f"[Job {job_id}] Incremental load queued: {'; '.join(parts)}."
                 )
         else:
-            # No similar tables found, proceed with OTL
-            logger.info(f"[Job {job_id}] No similar tables found. Proceeding with One-Time Load (OTL).")
+            # No Milvus match — try column-based fallback (IDF-weighted overlap)
+            logger.info(f"[Job {job_id}] No Milvus match. Trying column-based fallback.")
+            new_columns = processed_df.columns.tolist()
+            fallback_result = schema_validator.find_similar_table_by_columns(
+                new_columns=new_columns,
+                min_overlap=settings.column_fallback_min_overlap,
+            )
+
+            if fallback_result:
+                matched_table_name, overlap_score = fallback_result
+                logger.info(
+                    f"[Job {job_id}] Column fallback matched: {matched_table_name} "
+                    f"(IDF-weighted overlap: {overlap_score:.2%})"
+                )
+
+                # Build a synthetic similar_tables entry so the rest of the
+                # pipeline can reuse the same validation code path
+                similarity_score = overlap_score
+                similar_tables = [{
+                    'table_name': matched_table_name,
+                    'similarity_score': overlap_score,
+                    'created_at': '',
+                    'match_source': 'column_fallback',
+                }]
+
+                # -- Run the same validation pipeline as the Milvus path --
+
+                # Fetch existing table column types for type-drift detection
+                existing_db_types = db_manager.get_table_column_types(matched_table_name)
+                new_types_lower = {k.lower(): v for k, v in column_types.items()}
+
+                is_compatible, validation_result, report = schema_validator.validate_incremental_load(
+                    table_name=matched_table_name,
+                    new_columns=new_columns,
+                    new_file_name=Path(file_path).name,
+                    new_types=new_types_lower,
+                    existing_types=existing_db_types
+                )
+                is_additive_evolution = validation_result.get('is_additive_evolution', False)
+
+                # Guard: reject if column overlap is too low
+                match_pct = validation_result.get('match_percentage', 0.0)
+                if match_pct < settings.schema_match_min_percentage:
+                    logger.warning(
+                        f"[Job {job_id}] Column fallback schema overlap too low "
+                        f"({match_pct:.1f}% < {settings.schema_match_min_percentage}%) "
+                        f"for '{matched_table_name}' — treating as OTL"
+                    )
+                    similar_tables = []
+
+                # LLM semantic verification
+                if similar_tables:
+                    logger.info(
+                        f"[Job {job_id}] Running LLM semantic verification "
+                        f"for column-fallback match '{matched_table_name}'"
+                    )
+                    matched_metadata = schema_validator.fetch_table_metadata(matched_table_name) or {}
+                    semantic_result = schema_validator.verify_semantic_match(
+                        matched_table_name=matched_table_name,
+                        matched_table_metadata=matched_metadata,
+                        new_table_name=table_name,
+                        new_columns=new_columns,
+                        new_llm_metadata=llm_metadata,
+                        similarity_score=similarity_score,
+                    )
+                    logger.info(
+                        f"[Job {job_id}] Semantic verification: "
+                        f"is_related={semantic_result['is_related']}, "
+                        f"confidence={semantic_result['confidence']:.2f}, "
+                        f"reasoning='{semantic_result['reasoning']}'"
+                    )
+                    if not semantic_result['is_related']:
+                        logger.warning(
+                            f"[Job {job_id}] LLM rejected column-fallback match "
+                            f"'{matched_table_name}' — treating as OTL"
+                        )
+                        similar_tables = []
+
+                # If the fallback match survived all guards, route to IL
+                if similar_tables:
+                    logger.info(
+                        f"[Job {job_id}] Column fallback validated. "
+                        f"Schema: compatible={is_compatible}, "
+                        f"additive_evolution={is_additive_evolution}"
+                    )
+                    logger.info(f"[Job {job_id}] Validation report:\n{report}")
+
+                    job_manager.set_similarity_results(
+                        job_id=job_id,
+                        similar_tables=similar_tables,
+                        matched_table_name=matched_table_name
+                    )
+                    job_manager.set_schema_validation(
+                        job_id=job_id,
+                        schema_validation=validation_result,
+                        is_incremental_load=True
+                    )
+
+                    # Duplicate detection
+                    logger.info(f"[Job {job_id}] Checking for duplicate data")
+                    duplicate_result = schema_validator.detect_duplicate_data(
+                        table_name=matched_table_name,
+                        new_df=processed_df
+                    )
+                    logger.info(f"[Job {job_id}] Duplicate detection: {duplicate_result['status']}")
+                    logger.info(f"[Job {job_id}] {duplicate_result['message']}")
+
+                    job = job_manager.get_job(job_id)
+                    if job:
+                        job.duplicate_detection = duplicate_result
+
+                    has_schema_changes = not is_compatible
+                    is_full_duplicate = duplicate_result['status'] == 'DUPLICATE'
+
+                    if is_full_duplicate and not has_schema_changes:
+                        job_manager.update_status(job_id, JobStatus.DUPLICATE_DATA_DETECTED)
+                        logger.warning(
+                            f"[Job {job_id}] Exact duplicate detected via column fallback. "
+                            "Awaiting user decision."
+                        )
+                    else:
+                        job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
+                        parts = []
+                        if duplicate_result['status'] in ['DUPLICATE', 'PARTIAL_OVERLAP']:
+                            parts.append("duplicate/overlap detected (UPSERT will handle)")
+                        if is_compatible:
+                            parts.append("exact schema match")
+                        elif is_additive_evolution:
+                            parts.append("additive schema evolution — new columns will be added automatically")
+                        else:
+                            parts.append("schema differences require review")
+                        logger.info(
+                            f"[Job {job_id}] Incremental load queued (column fallback): "
+                            f"{'; '.join(parts)}."
+                        )
+                else:
+                    logger.info(
+                        f"[Job {job_id}] Column fallback match rejected by guards. "
+                        "Trying peer-job matching."
+                    )
+
+            # -- Peer-job matching (batch detection) --
+            # If we still have no match, check other preprocessed jobs in memory
+            if not similar_tables:
+                logger.info(f"[Job {job_id}] Trying peer-job match (batch detection).")
+                new_columns = processed_df.columns.tolist()
+                peer_result = job_manager.find_peer_job_by_columns(
+                    current_job_id=job_id,
+                    new_columns=new_columns,
+                    min_overlap=settings.column_fallback_min_overlap,
+                )
+
+                if peer_result:
+                    peer_jid, peer_table, peer_score = peer_result
+                    logger.info(
+                        f"[Job {job_id}] Peer-job match found: job={peer_jid}, "
+                        f"table={peer_table}, overlap={peer_score:.2%}"
+                    )
+
+                    # Build synthetic match entry
+                    matched_table_name = peer_table
+                    similarity_score = peer_score
+                    similar_tables = [{
+                        'table_name': peer_table,
+                        'similarity_score': peer_score,
+                        'created_at': '',
+                        'match_source': 'peer_job',
+                        'peer_job_id': peer_jid,
+                    }]
+
+                    # LLM semantic verification for the peer match
+                    logger.info(
+                        f"[Job {job_id}] Running LLM semantic verification "
+                        f"for peer-job match '{peer_table}'"
+                    )
+                    peer_job = job_manager.get_job(peer_jid)
+                    peer_metadata = peer_job.llm_metadata or {} if peer_job else {}
+                    # Build a metadata dict compatible with verify_semantic_match
+                    peer_meta_for_verify = {
+                        'description': peer_metadata.get('description', ''),
+                        'data_domain': peer_metadata.get('data_domain', ''),
+                    }
+                    peer_columns = (peer_job.processed_df.columns.tolist()
+                                    if peer_job and peer_job.processed_df is not None
+                                    else [])
+                    semantic_result = schema_validator.verify_semantic_match(
+                        matched_table_name=peer_table,
+                        matched_table_metadata=peer_meta_for_verify,
+                        new_table_name=table_name,
+                        new_columns=new_columns,
+                        new_llm_metadata=llm_metadata,
+                        similarity_score=similarity_score,
+                    )
+                    logger.info(
+                        f"[Job {job_id}] Peer-job semantic verification: "
+                        f"is_related={semantic_result['is_related']}, "
+                        f"confidence={semantic_result['confidence']:.2f}, "
+                        f"reasoning='{semantic_result['reasoning']}'"
+                    )
+                    if not semantic_result['is_related']:
+                        logger.warning(
+                            f"[Job {job_id}] LLM rejected peer-job match "
+                            f"'{peer_table}' (job {peer_jid}) -- treating as OTL"
+                        )
+                        similar_tables = []
+
+                    # If peer match survived, route to IL
+                    if similar_tables:
+                        # Store the peer anchor reference
+                        job = job_manager.get_job(job_id)
+                        if job:
+                            job.peer_anchor_job_id = peer_jid
+
+                        job_manager.set_similarity_results(
+                            job_id=job_id,
+                            similar_tables=similar_tables,
+                            matched_table_name=matched_table_name
+                        )
+
+                        # For peer matches, we do a simplified schema validation
+                        # since the target table doesn't exist in DB yet
+                        peer_cols = peer_columns
+                        overlap_cols = set(c.lower() for c in new_columns) & set(c.lower() for c in peer_cols)
+                        match_pct = (len(overlap_cols) / len(peer_cols) * 100) if peer_cols else 0
+                        validation_result = {
+                            'is_compatible': set(c.lower() for c in new_columns) == set(c.lower() for c in peer_cols),
+                            'match_percentage': match_pct,
+                            'matching_columns': list(overlap_cols),
+                            'missing_columns': [c for c in peer_cols if c.lower() not in {x.lower() for x in new_columns}],
+                            'extra_columns': [c for c in new_columns if c.lower() not in {x.lower() for x in peer_cols}],
+                            'is_additive_evolution': len([c for c in new_columns if c.lower() not in {x.lower() for x in peer_cols}]) > 0
+                                                     and len([c for c in peer_cols if c.lower() not in {x.lower() for x in new_columns}]) == 0,
+                            'match_source': 'peer_job',
+                        }
+
+                        job_manager.set_schema_validation(
+                            job_id=job_id,
+                            schema_validation=validation_result,
+                            is_incremental_load=True
+                        )
+
+                        job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
+                        logger.info(
+                            f"[Job {job_id}] Peer-job incremental load detected. "
+                            f"Target table: {peer_table} (from job {peer_jid}). "
+                            f"Schema match: {match_pct:.1f}%"
+                        )
+                    else:
+                        logger.info(
+                            f"[Job {job_id}] Peer-job match rejected. "
+                            "Proceeding with OTL."
+                        )
+                else:
+                    logger.info(
+                        f"[Job {job_id}] No matches found (Milvus + column fallback + peer jobs). "
+                        "Proceeding with One-Time Load (OTL)."
+                    )
 
         # Step 10: Store preprocessing results
         job_manager.set_preprocessing_results(

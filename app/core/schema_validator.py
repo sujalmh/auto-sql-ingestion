@@ -1,4 +1,5 @@
 import json
+import math
 from typing import Dict, List, Optional, Tuple
 from app.core.database import db_manager, _WIDENING_GROUPS
 from app.core.logger import logger
@@ -66,38 +67,129 @@ class SchemaValidator:
             logger.error(f"Error fetching table metadata: {str(e)}")
             return None
 
+    def _compute_column_idf(
+        self,
+        all_table_columns: Dict[str, set],
+    ) -> Dict[str, float]:
+        """
+        Compute inverse document frequency for each column across all tables.
+
+        IDF(col) = log(total_tables / tables_containing_col)
+
+        Columns appearing in every table get IDF ≈ 0 (non-discriminative).
+        Columns unique to one table get the highest IDF (highly discriminative).
+
+        Args:
+            all_table_columns: {table_name: {normalized_col_names}}
+
+        Returns:
+            {normalized_col_name: idf_score}
+        """
+        total_tables = len(all_table_columns)
+        if total_tables == 0:
+            return {}
+
+        # Count how many tables each column appears in
+        col_doc_freq: Dict[str, int] = {}
+        for cols in all_table_columns.values():
+            for col in cols:
+                col_doc_freq[col] = col_doc_freq.get(col, 0) + 1
+
+        # Compute IDF: log(N / df).  Use log(N / df) + 1 to ensure even
+        # columns in a single table get a positive weight.
+        idf: Dict[str, float] = {}
+        for col, df in col_doc_freq.items():
+            idf[col] = math.log(total_tables / df) + 1.0
+        return idf
+
     def find_similar_table_by_columns(
         self,
         new_columns: List[str],
-        min_overlap: float = 0.8,
+        min_overlap: float = 0.7,
     ) -> Optional[Tuple[str, float]]:
         """
         Fallback when Milvus is unavailable or returns no results: find an existing
-        table whose columns overlap with new_columns (after normalizing period/date
-        in names) so that e.g. Jan upload can match Dec table without Milvus.
-        Returns (table_name, score) or None.
+        table whose columns overlap with new_columns using IDF-weighted scoring.
+
+        IDF weighting ensures that columns appearing in many tables (e.g. generic
+        format columns like 'element', 'year', 'value') contribute less to the
+        score than domain-specific columns.  This prevents false matches between
+        unrelated tables that share only generic columns.
+
+        Args:
+            new_columns: Column names from the incoming file.
+            min_overlap: Minimum IDF-weighted overlap score (0-1) to accept a match.
+
+        Returns:
+            (table_name, weighted_score) or None.
         """
         tables = db_manager.list_tables_from_metadata()
         if not tables:
             logger.info("No tables in tables_metadata for fallback match")
             return None
+
         new_norm = {normalize_column_for_similarity(c) for c in new_columns}
         if not new_norm:
             return None
-        best_table, best_score = None, 0.0
+
+        # First pass: collect normalized columns for every table
+        all_table_columns: Dict[str, set] = {}
+        table_metadata_cache: Dict[str, Optional[Dict]] = {}
         for table_name in tables:
             meta = self.fetch_table_metadata(table_name)
-            if not meta or not meta.get("columns"):
-                continue
-            existing_norm = {normalize_column_for_similarity(c) for c in meta["columns"]}
+            table_metadata_cache[table_name] = meta
+            if meta and meta.get("columns"):
+                norm_cols = {normalize_column_for_similarity(c) for c in meta["columns"]}
+                # Exclude pipeline-managed audit column
+                norm_cols.discard("ingested_at")
+                all_table_columns[table_name] = norm_cols
+
+        if not all_table_columns:
+            logger.info("No tables with columns found for fallback match")
+            return None
+
+        # Include the new file's columns in the IDF corpus so its unique
+        # columns also receive proper IDF weighting
+        idf_corpus = dict(all_table_columns)
+        idf_corpus["__new_file__"] = new_norm
+        idf = self._compute_column_idf(idf_corpus)
+
+        # Second pass: compute IDF-weighted overlap for each table
+        best_table, best_score = None, 0.0
+        for table_name, existing_norm in all_table_columns.items():
             if not existing_norm:
                 continue
-            overlap = len(new_norm & existing_norm) / len(existing_norm)
-            if overlap >= min_overlap and overlap > best_score:
-                best_score = overlap
+
+            matched_cols = new_norm & existing_norm
+            if not matched_cols:
+                continue
+
+            # Weighted score: sum of IDF for matched cols / sum of IDF for existing cols
+            matched_weight = sum(idf.get(c, 1.0) for c in matched_cols)
+            total_weight = sum(idf.get(c, 1.0) for c in existing_norm)
+
+            if total_weight == 0:
+                continue
+
+            weighted_score = matched_weight / total_weight
+
+            logger.debug(
+                f"Column fallback: {table_name} — "
+                f"matched={len(matched_cols)}/{len(existing_norm)}, "
+                f"weighted_score={weighted_score:.3f}"
+            )
+
+            if weighted_score >= min_overlap and weighted_score > best_score:
+                best_score = weighted_score
                 best_table = table_name
+
         if best_table is not None:
-            logger.info(f"Fallback match: {best_table} (normalized column overlap: {best_score:.2%})")
+            logger.info(
+                f"Fallback match: {best_table} "
+                f"(IDF-weighted column overlap: {best_score:.2%})"
+            )
+        else:
+            logger.info("No fallback match found above threshold")
         return (best_table, best_score) if best_table else None
 
     def compare_column_types(

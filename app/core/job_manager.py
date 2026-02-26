@@ -1,10 +1,12 @@
 import uuid
+import math
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple, Set
 from enum import Enum
 import threading
 import pandas as pd
 from app.core.logger import logger
+from app.core.column_utils import normalize_column_for_similarity
 
 
 class JobStatus(str, Enum):
@@ -59,6 +61,9 @@ class JobData:
         
         # User defined overrides
         self.table_name: Optional[str] = None
+        
+        # Batch peer-matching: ID of the OTL "anchor" job this IL targets
+        self.peer_anchor_job_id: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert job data to dictionary (excluding DataFrame)."""
@@ -368,6 +373,87 @@ class JobManager:
                 logger.info(f"Cleaned up {len(expired_ids)} expired jobs")
             
             return len(expired_ids)
+
+    def find_peer_job_by_columns(
+        self,
+        current_job_id: str,
+        new_columns: List[str],
+        min_overlap: float = 0.7,
+    ) -> Optional[Tuple[str, str, float]]:
+        """
+        Search preprocessed peer jobs for column overlap (batch detection).
+
+        When multiple files are uploaded together, the first finishes
+        preprocessing as OTL.  Subsequent files call this method to
+        detect that an earlier job in the same batch has the same schema.
+
+        Args:
+            current_job_id: Job to exclude from search.
+            new_columns: Column names of the new file.
+            min_overlap: Minimum IDF-weighted overlap (0-1).
+
+        Returns:
+            (peer_job_id, peer_table_name, overlap_score)  or  None
+        """
+        # Statuses that indicate a job has been preprocessed and is waiting
+        eligible_statuses = {
+            JobStatus.AWAITING_APPROVAL,
+            JobStatus.SCHEMA_MISMATCH,
+            JobStatus.DUPLICATE_DATA_DETECTED,
+        }
+
+        norm_new = {normalize_column_for_similarity(c) for c in new_columns}
+        if not norm_new:
+            return None
+
+        # Collect column sets from all eligible peer jobs (for IDF)
+        peer_col_sets: Dict[str, Set[str]] = {}  # job_id -> normalized columns
+        with self._lock:
+            for jid, job in self._jobs.items():
+                if jid == current_job_id:
+                    continue
+                if job.status not in eligible_statuses:
+                    continue
+                if job.processed_df is None:
+                    continue
+                peer_cols = {normalize_column_for_similarity(c)
+                             for c in job.processed_df.columns.tolist()}
+                if peer_cols:
+                    peer_col_sets[jid] = peer_cols
+
+        if not peer_col_sets:
+            return None
+
+        # Compute IDF across the new file + all peers
+        all_tables = {"__new__": norm_new}
+        all_tables.update(peer_col_sets)
+        total = len(all_tables)
+        col_freq: Dict[str, int] = {}
+        for cols in all_tables.values():
+            for c in cols:
+                col_freq[c] = col_freq.get(c, 0) + 1
+        idf = {col: math.log(total / df) + 1.0 for col, df in col_freq.items()}
+
+        # Find best match
+        best: Optional[Tuple[str, float]] = None
+        for jid, peer_cols in peer_col_sets.items():
+            matched = norm_new & peer_cols
+            if not matched:
+                continue
+            matched_w = sum(idf.get(c, 1.0) for c in matched)
+            total_w = sum(idf.get(c, 1.0) for c in peer_cols)
+            score = matched_w / total_w if total_w > 0 else 0.0
+            if score >= min_overlap and (best is None or score > best[1]):
+                best = (jid, score)
+
+        if best is None:
+            return None
+
+        peer_jid, score = best
+        with self._lock:
+            peer_job = self._jobs.get(peer_jid)
+            peer_table = peer_job.proposed_table_name if peer_job else None
+        return (peer_jid, peer_table or "", score)
 
 
 # Global job manager instance
