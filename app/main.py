@@ -747,6 +747,43 @@ async def preprocess_file(job_id: str, file_path: str, file_description: str = N
             )
 
             is_additive_evolution = validation_result.get('is_additive_evolution', False)
+
+            # Guard: reject the match if column overlap is too low
+            match_pct = validation_result.get('match_percentage', 0.0)
+            if match_pct < settings.schema_match_min_percentage:
+                logger.warning(
+                    f"[Job {job_id}] Schema overlap too low ({match_pct:.1f}% < "
+                    f"{settings.schema_match_min_percentage}%) for match '{matched_table_name}' "
+                    f"— treating as new table (OTL)"
+                )
+                similar_tables = []  # discard match — fall through to OTL path below
+
+            # Step 9b: LLM semantic verification — confirm the match is meaningful
+            if similar_tables:
+                logger.info(f"[Job {job_id}] Running LLM semantic verification for match '{matched_table_name}'")
+                matched_metadata = schema_validator.fetch_table_metadata(matched_table_name) or {}
+                semantic_result = schema_validator.verify_semantic_match(
+                    matched_table_name=matched_table_name,
+                    matched_table_metadata=matched_metadata,
+                    new_table_name=table_name,
+                    new_columns=new_columns,
+                    new_llm_metadata=llm_metadata,
+                    similarity_score=similarity_score,
+                )
+                logger.info(
+                    f"[Job {job_id}] Semantic verification: is_related={semantic_result['is_related']}, "
+                    f"confidence={semantic_result['confidence']:.2f}, "
+                    f"reasoning='{semantic_result['reasoning']}'"
+                )
+                if not semantic_result['is_related']:
+                    logger.warning(
+                        f"[Job {job_id}] LLM rejected match '{matched_table_name}' as semantically "
+                        f"unrelated (confidence={semantic_result['confidence']:.2f}) — treating as OTL"
+                    )
+                    similar_tables = []  # discard match — fall through to OTL path below
+
+        # Re-check after potential guard rejection
+        if similar_tables and len(similar_tables) > 0:
             logger.info(
                 f"[Job {job_id}] Schema validation: compatible={is_compatible}, "
                 f"additive_evolution={is_additive_evolution}"

@@ -25,8 +25,10 @@ class Settings(BaseSettings):
     milvus_db: str = "default"  # Milvus database name
     
     # Similarity Search Configuration (threshold allows Dec/Jan-style period variants to match)
-    similarity_threshold: float = 0.78
+    similarity_threshold: float = 0.85
     similarity_top_k: int = 5
+    # Minimum column-overlap percentage to accept a Milvus match as incremental load
+    schema_match_min_percentage: float = 60.0
     
     # OpenAI Embeddings
     embedding_model: str = "text-embedding-3-small"
