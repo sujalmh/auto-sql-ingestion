@@ -360,7 +360,8 @@ class DatabaseManager:
             
             logger.debug(f"INSERT statement template: {insert_statement}")
             
-            retried_after_widen = False
+            overflow_retry_count = 0
+            max_overflow_retries = 3
             while True:
                 try:
                     with self.get_connection() as conn:
@@ -369,7 +370,7 @@ class DatabaseManager:
                             execute_batch(cur, insert_statement, data, page_size=batch_size)
                     break
                 except Exception as e:
-                    if not retried_after_widen:
+                    if overflow_retry_count < max_overflow_retries:
                         if self._is_integer_overflow_error(e):
                             widen_bigint = "bigint out of range" in str(e).lower()
                             widened = self._widen_integer_columns_for_retry(
@@ -378,17 +379,19 @@ class DatabaseManager:
                                 widen_bigint_to_numeric=widen_bigint,
                             )
                             if widened:
-                                retried_after_widen = True
+                                overflow_retry_count += 1
                                 logger.warning(
-                                    f"Retrying insert into '{table_name}' after integer widening"
+                                    f"Retrying insert into '{table_name}' after integer widening "
+                                    f"(attempt {overflow_retry_count}/{max_overflow_retries})"
                                 )
                                 continue
                         if self._is_numeric_overflow_error(e):
                             widened = self._widen_numeric_columns_for_retry(table_name, df)
                             if widened:
-                                retried_after_widen = True
+                                overflow_retry_count += 1
                                 logger.warning(
-                                    f"Retrying insert into '{table_name}' after numeric widening"
+                                    f"Retrying insert into '{table_name}' after numeric widening "
+                                    f"(attempt {overflow_retry_count}/{max_overflow_retries})"
                                 )
                                 continue
                     raise
@@ -782,7 +785,8 @@ class DatabaseManager:
         updated_count  = 0
 
         try:
-            retried_after_widen = False
+            overflow_retry_count = 0
+            max_overflow_retries = 3
             while True:
                 try:
                     inserted_count = 0
@@ -800,7 +804,7 @@ class DatabaseManager:
                                         updated_count += 1
                     break
                 except Exception as e:
-                    if not retried_after_widen:
+                    if overflow_retry_count < max_overflow_retries:
                         if self._is_integer_overflow_error(e):
                             widen_bigint = "bigint out of range" in str(e).lower()
                             widened = self._widen_integer_columns_for_retry(
@@ -809,17 +813,19 @@ class DatabaseManager:
                                 widen_bigint_to_numeric=widen_bigint,
                             )
                             if widened:
-                                retried_after_widen = True
+                                overflow_retry_count += 1
                                 logger.warning(
-                                    f"Retrying upsert into '{table_name}' after integer widening"
+                                    f"Retrying upsert into '{table_name}' after integer widening "
+                                    f"(attempt {overflow_retry_count}/{max_overflow_retries})"
                                 )
                                 continue
                         if self._is_numeric_overflow_error(e):
                             widened = self._widen_numeric_columns_for_retry(table_name, df)
                             if widened:
-                                retried_after_widen = True
+                                overflow_retry_count += 1
                                 logger.warning(
-                                    f"Retrying upsert into '{table_name}' after numeric widening"
+                                    f"Retrying upsert into '{table_name}' after numeric widening "
+                                    f"(attempt {overflow_retry_count}/{max_overflow_retries})"
                                 )
                                 continue
                     raise
