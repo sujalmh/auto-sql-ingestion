@@ -201,6 +201,55 @@ class DatabaseManager:
                     for safe_col in alterations:
                         cur.execute(f"ALTER TABLE {safe_table} ALTER COLUMN {safe_col} TYPE TEXT")
 
+    @staticmethod
+    def _is_numeric_overflow_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        code = getattr(exc, "pgcode", None)
+        return code == "22003" and "numeric" in msg and "overflow" in msg
+
+    def _widen_numeric_columns_for_retry(self, table_name: str, df: pd.DataFrame) -> List[str]:
+        """
+        Widen numeric/decimal columns present in the incoming DataFrame to
+        unconstrained NUMERIC so inserts do not fail on precision overflow
+        (e.g. NUMERIC(15,2) receiving larger values).
+        """
+        widened: List[str] = []
+        df_cols = {_normal_col.lower(): _normal_col for _normal_col in df.columns}
+        safe_table = self._sanitize_identifier(table_name)
+
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = %s
+                          AND data_type IN ('numeric', 'decimal')
+                        """,
+                        (table_name.lower(),),
+                    )
+                    numeric_cols = [row[0] for row in cur.fetchall()]
+
+                    for col in numeric_cols:
+                        if col.lower() not in df_cols:
+                            continue
+                        safe_col = self._sanitize_identifier(col)
+                        cur.execute(
+                            f"ALTER TABLE {safe_table} ALTER COLUMN {safe_col} TYPE NUMERIC USING {safe_col}::NUMERIC"
+                        )
+                        widened.append(col)
+
+            if widened:
+                logger.warning(
+                    f"Widened numeric columns to unconstrained NUMERIC for retry in '{table_name}': {widened}"
+                )
+            return widened
+        except Exception as e:
+            logger.error(f"Failed to widen numeric columns for '{table_name}': {e}")
+            return []
+
     def insert_data(
         self,
         table_name: str,
@@ -244,10 +293,24 @@ class DatabaseManager:
             
             logger.debug(f"INSERT statement template: {insert_statement}")
             
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    # Use execute_batch for better performance
-                    execute_batch(cur, insert_statement, data, page_size=batch_size)
+            retried_after_widen = False
+            while True:
+                try:
+                    with self.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            # Use execute_batch for better performance
+                            execute_batch(cur, insert_statement, data, page_size=batch_size)
+                    break
+                except Exception as e:
+                    if (not retried_after_widen) and self._is_numeric_overflow_error(e):
+                        widened = self._widen_numeric_columns_for_retry(table_name, df)
+                        if widened:
+                            retried_after_widen = True
+                            logger.warning(
+                                f"Retrying insert into '{table_name}' after numeric widening"
+                            )
+                            continue
+                    raise
             
             logger.info(f"Successfully inserted {len(df)} rows into '{table_name}'")
             return len(df)
@@ -638,17 +701,33 @@ class DatabaseManager:
         updated_count  = 0
 
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    for i in range(0, len(rows_data), batch_size):
-                        batch = rows_data[i : i + batch_size]
-                        execute_values(cur, insert_sql, batch)
-                        results = cur.fetchall()
-                        for (was_inserted,) in results:
-                            if was_inserted:
-                                inserted_count += 1
-                            else:
-                                updated_count += 1
+            retried_after_widen = False
+            while True:
+                try:
+                    inserted_count = 0
+                    updated_count = 0
+                    with self.get_connection() as conn:
+                        with conn.cursor() as cur:
+                            for i in range(0, len(rows_data), batch_size):
+                                batch = rows_data[i : i + batch_size]
+                                execute_values(cur, insert_sql, batch)
+                                results = cur.fetchall()
+                                for (was_inserted,) in results:
+                                    if was_inserted:
+                                        inserted_count += 1
+                                    else:
+                                        updated_count += 1
+                    break
+                except Exception as e:
+                    if (not retried_after_widen) and self._is_numeric_overflow_error(e):
+                        widened = self._widen_numeric_columns_for_retry(table_name, df)
+                        if widened:
+                            retried_after_widen = True
+                            logger.warning(
+                                f"Retrying upsert into '{table_name}' after numeric widening"
+                            )
+                            continue
+                    raise
 
             logger.info(
                 f"Upsert into '{table_name}': {inserted_count} inserted, "
