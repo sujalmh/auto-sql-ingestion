@@ -207,6 +207,73 @@ class DatabaseManager:
         code = getattr(exc, "pgcode", None)
         return code == "22003" and "numeric" in msg and "overflow" in msg
 
+    @staticmethod
+    def _is_integer_overflow_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        code = getattr(exc, "pgcode", None)
+        return code == "22003" and (
+            "integer out of range" in msg or "bigint out of range" in msg
+        )
+
+    def _widen_integer_columns_for_retry(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        widen_bigint_to_numeric: bool = False,
+    ) -> List[str]:
+        """
+        Widen integer-family columns for overflow recovery.
+
+        - smallint/integer -> BIGINT
+        - bigint -> NUMERIC (only when widen_bigint_to_numeric=True)
+        """
+        widened: List[str] = []
+        df_cols = {str(col).lower() for col in df.columns}
+        safe_table = self._sanitize_identifier(table_name)
+
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT column_name, data_type
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = %s
+                          AND data_type IN ('smallint', 'integer', 'bigint')
+                        """,
+                        (table_name.lower(),),
+                    )
+                    int_cols = cur.fetchall()
+
+                    for col_name, data_type in int_cols:
+                        if col_name.lower() not in df_cols:
+                            continue
+
+                        target_type = None
+                        if data_type in ("smallint", "integer"):
+                            target_type = "BIGINT"
+                        elif data_type == "bigint" and widen_bigint_to_numeric:
+                            target_type = "NUMERIC"
+
+                        if not target_type:
+                            continue
+
+                        safe_col = self._sanitize_identifier(col_name)
+                        cur.execute(
+                            f"ALTER TABLE {safe_table} ALTER COLUMN {safe_col} TYPE {target_type} USING {safe_col}::{target_type}"
+                        )
+                        widened.append(col_name)
+
+            if widened:
+                logger.warning(
+                    f"Widened integer columns for retry in '{table_name}': {widened}"
+                )
+            return widened
+        except Exception as e:
+            logger.error(f"Failed to widen integer columns for '{table_name}': {e}")
+            return []
+
     def _widen_numeric_columns_for_retry(self, table_name: str, df: pd.DataFrame) -> List[str]:
         """
         Widen numeric/decimal columns present in the incoming DataFrame to
@@ -302,14 +369,28 @@ class DatabaseManager:
                             execute_batch(cur, insert_statement, data, page_size=batch_size)
                     break
                 except Exception as e:
-                    if (not retried_after_widen) and self._is_numeric_overflow_error(e):
-                        widened = self._widen_numeric_columns_for_retry(table_name, df)
-                        if widened:
-                            retried_after_widen = True
-                            logger.warning(
-                                f"Retrying insert into '{table_name}' after numeric widening"
+                    if not retried_after_widen:
+                        if self._is_integer_overflow_error(e):
+                            widen_bigint = "bigint out of range" in str(e).lower()
+                            widened = self._widen_integer_columns_for_retry(
+                                table_name,
+                                df,
+                                widen_bigint_to_numeric=widen_bigint,
                             )
-                            continue
+                            if widened:
+                                retried_after_widen = True
+                                logger.warning(
+                                    f"Retrying insert into '{table_name}' after integer widening"
+                                )
+                                continue
+                        if self._is_numeric_overflow_error(e):
+                            widened = self._widen_numeric_columns_for_retry(table_name, df)
+                            if widened:
+                                retried_after_widen = True
+                                logger.warning(
+                                    f"Retrying insert into '{table_name}' after numeric widening"
+                                )
+                                continue
                     raise
             
             logger.info(f"Successfully inserted {len(df)} rows into '{table_name}'")
@@ -719,14 +800,28 @@ class DatabaseManager:
                                         updated_count += 1
                     break
                 except Exception as e:
-                    if (not retried_after_widen) and self._is_numeric_overflow_error(e):
-                        widened = self._widen_numeric_columns_for_retry(table_name, df)
-                        if widened:
-                            retried_after_widen = True
-                            logger.warning(
-                                f"Retrying upsert into '{table_name}' after numeric widening"
+                    if not retried_after_widen:
+                        if self._is_integer_overflow_error(e):
+                            widen_bigint = "bigint out of range" in str(e).lower()
+                            widened = self._widen_integer_columns_for_retry(
+                                table_name,
+                                df,
+                                widen_bigint_to_numeric=widen_bigint,
                             )
-                            continue
+                            if widened:
+                                retried_after_widen = True
+                                logger.warning(
+                                    f"Retrying upsert into '{table_name}' after integer widening"
+                                )
+                                continue
+                        if self._is_numeric_overflow_error(e):
+                            widened = self._widen_numeric_columns_for_retry(table_name, df)
+                            if widened:
+                                retried_after_widen = True
+                                logger.warning(
+                                    f"Retrying upsert into '{table_name}' after numeric widening"
+                                )
+                                continue
                     raise
 
             logger.info(
