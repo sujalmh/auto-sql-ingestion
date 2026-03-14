@@ -101,3 +101,5 @@ test_deletion_flow.py
 **/__pycache__/
 **/*.pyc
 **/*.pyo
+# Local test scripts
+test_*.py
