@@ -103,3 +103,4 @@ test_deletion_flow.py
 **/*.pyo
 # Local test scripts
 test_*.py
+start.sh
