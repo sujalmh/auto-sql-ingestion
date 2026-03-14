@@ -366,6 +366,9 @@ class DataPreprocessor:
         summary_steps = []
         original_col_count = len(df.columns)
         
+        # Capture raw column names before any cleaning (for unit extraction)
+        raw_column_names = [str(c) for c in df.columns]
+        
         # Step 1: Merge headers if needed
         df = self.merge_headers(df, analysis)
         if analysis.get("needs_header_merge"):
@@ -386,6 +389,12 @@ class DataPreprocessor:
         if data_period:
             df["data_period"] = self._normalize_mmm_yyyy(data_period)
         
+        # Step 5: Extract unit info from raw column names into separate columns
+        df = self._extract_units(df, raw_column_names)
+        
+        # Step 6: Add month_numeric column if derivable
+        df = self._add_month_numeric(df)
+        
         # Check if any columns were dropped
         dropped_cols = original_col_count - len(df.columns)
         if dropped_cols > 0:
@@ -397,6 +406,135 @@ class DataPreprocessor:
         logger.info(f"Preprocessing completed: {summary}")
         
         return df, summary
+
+    # ── Month-name-to-number mapping (full + abbreviated, lowercase) ──
+    _MONTH_MAP = {
+        'january': 1, 'jan': 1,
+        'february': 2, 'feb': 2,
+        'march': 3, 'mar': 3,
+        'april': 4, 'apr': 4,
+        'may': 5,
+        'june': 6, 'jun': 6,
+        'july': 7, 'jul': 7,
+        'august': 8, 'aug': 8,
+        'september': 9, 'sep': 9, 'sept': 9,
+        'october': 10, 'oct': 10,
+        'november': 11, 'nov': 11,
+        'december': 12, 'dec': 12,
+    }
+
+    def _add_month_numeric(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Deterministically add a `month_numeric` column (1-12) when derivable.
+
+        Priority:
+          a. Column already exists → skip.
+          b. A 'month' column with all-numeric 1-12 values → rename to month_numeric.
+          c. A 'month' column with text month names → keep original + add month_numeric.
+          d. A 'period' column with parseable dates → derive month_numeric.
+          e. A 'month_name' column (no 'month' column) → derive month_numeric.
+        """
+        cols_lower = {c.lower(): c for c in df.columns}
+
+        # (a) Already present
+        if 'month_numeric' in cols_lower:
+            logger.info("month_numeric column already exists, skipping derivation")
+            return df
+
+        # (b) 'month' column with numeric values 1-12
+        if 'month' in cols_lower:
+            month_col = cols_lower['month']
+            try:
+                numeric_vals = pd.to_numeric(df[month_col], errors='coerce')
+                if numeric_vals.dropna().between(1, 12).all() and numeric_vals.notna().sum() > 0:
+                    df = df.rename(columns={month_col: 'month_numeric'})
+                    logger.info(f"Renamed numeric '{month_col}' column to month_numeric")
+                    return df
+            except Exception:
+                pass
+
+            # (c) 'month' column with text month names
+            text_vals = df[month_col].dropna().astype(str).str.strip().str.lower()
+            mapped = text_vals.map(self._MONTH_MAP)
+            if mapped.notna().sum() > 0 and mapped.notna().sum() / max(len(mapped), 1) > 0.5:
+                df['month_numeric'] = df[month_col].astype(str).str.strip().str.lower().map(self._MONTH_MAP)
+                logger.info(f"Derived month_numeric from text '{month_col}' column")
+                return df
+
+        # (d) 'period' column with parseable dates
+        if 'period' in cols_lower:
+            period_col = cols_lower['period']
+            try:
+                parsed = pd.to_datetime(df[period_col], errors='coerce')
+                if parsed.notna().sum() / max(len(parsed), 1) > 0.5:
+                    df['month_numeric'] = parsed.dt.month
+                    logger.info(f"Derived month_numeric from '{period_col}' column")
+                    return df
+            except Exception:
+                pass
+            # Try regex extraction for formats like "Jan-2023", "Feb 2023"
+            try:
+                month_str = df[period_col].astype(str).str.strip().str.lower()
+                month_str = month_str.str.extract(r'^([a-z]+)', expand=False)
+                mapped = month_str.map(self._MONTH_MAP)
+                if mapped.notna().sum() / max(len(df), 1) > 0.5:
+                    df['month_numeric'] = mapped
+                    logger.info(f"Derived month_numeric from '{period_col}' via regex")
+                    return df
+            except Exception:
+                pass
+
+        # (e) 'month_name' column (no 'month' column)
+        if 'month_name' in cols_lower and 'month' not in cols_lower:
+            mn_col = cols_lower['month_name']
+            text_vals = df[mn_col].dropna().astype(str).str.strip().str.lower()
+            mapped = text_vals.map(self._MONTH_MAP)
+            if mapped.notna().sum() > 0:
+                df['month_numeric'] = df[mn_col].astype(str).str.strip().str.lower().map(self._MONTH_MAP)
+                logger.info(f"Derived month_numeric from '{mn_col}' column")
+                return df
+
+        logger.info("No month source found — month_numeric not added")
+        return df
+
+    def _extract_units(self, df: pd.DataFrame, raw_column_names: List[str]) -> pd.DataFrame:
+        """
+        For columns whose raw name contained parenthetical unit info
+        (e.g. "Quantity (000 Metric Tonnes)"), add a sibling `<col>_unit` column
+        with the constant unit string.
+        """
+        # Build mapping: cleaned_name → unit_string  from raw names
+        unit_pattern = re.compile(r'\(([^)]+)\)')
+        # Keywords that are NOT units (structural/formula markers)
+        non_unit_keywords = {'adjusted', 'unadjusted', 'total', 'net', 'gross',
+                             'actual', 'estimated', 'provisional', 'revised',
+                             'final', 'preliminary'}
+
+        raw_to_unit = {}
+        for raw in raw_column_names:
+            matches = unit_pattern.findall(raw)
+            for m in matches:
+                m_stripped = m.strip()
+                # Skip formulas like "2+3", pure numbers, and non-unit keywords
+                if re.match(r'^[\d+\-*/().]+$', m_stripped):
+                    continue
+                if m_stripped.lower() in non_unit_keywords:
+                    continue
+                # This looks like a unit — map raw name → unit
+                cleaned = self._clean_column_name(raw)
+                raw_to_unit[cleaned] = m_stripped
+
+        if not raw_to_unit:
+            return df
+
+        for cleaned_col, unit_str in raw_to_unit.items():
+            if cleaned_col in df.columns:
+                unit_col_name = f"{cleaned_col}_unit"
+                if unit_col_name not in df.columns:
+                    df[unit_col_name] = unit_str
+                    logger.info(f"Added unit column '{unit_col_name}' = '{unit_str}'")
+
+        return df
 
     def _normalize_mmm_yyyy(self, value: str) -> str:
         """Convert period string to Mmm-yyyy (e.g. Dec 2025)."""

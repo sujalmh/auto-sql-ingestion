@@ -727,8 +727,15 @@ async def _preprocess_file_inner(
         column_mapping = clean_result.get("mapping", {})
         drop_columns = clean_result.get("drop_columns", [])
 
-        # Drop redundant/metadata columns first
+        # Drop redundant/metadata columns first (with safeguard for critical columns)
         if drop_columns:
+            # Protect critical columns from being dropped by the LLM
+            protected_columns = {'month_numeric', 'month_name', 'month', 'year', 'period',
+                                 'state', 'value', 'total', 'refresh_date', 'data_period'}
+            protected_dropped = [c for c in drop_columns if c.lower() in protected_columns]
+            if protected_dropped:
+                logger.warning(f"[Job {job_id}] LLM tried to drop protected columns: {protected_dropped} — keeping them")
+            drop_columns = [c for c in drop_columns if c.lower() not in protected_columns]
             drop_present = [c for c in drop_columns if c in processed_df.columns]
             if drop_present:
                 processed_df = processed_df.drop(columns=drop_present)

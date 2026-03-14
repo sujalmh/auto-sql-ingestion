@@ -80,6 +80,9 @@ class Cat2Preprocessor:
         # 10. Reuse Cat1 clean_data
         df = preprocessor.clean_data(df)
 
+        # 11. Add month_numeric column if derivable
+        df = preprocessor._add_month_numeric(df)
+
         summary = " | ".join(summary_steps)
         return df, summary
 

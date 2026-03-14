@@ -59,7 +59,9 @@ File Information:
 - First 10 rows sample: {json.dumps(file_info['first_10_rows'], indent=2, default=str)}
 
 Tasks:
-1. date_columns: List ONLY columns whose HEADER VALUE is a period/year (e.g. "2011-12", "2012-13", "Q1", "January") for wide-to-long melt. Leave date_columns EMPTY if columns are metric names that merely mention a date in the description (e.g. "Funds Mobilised for the month of Dec 2025 (INR in crore)" or "No. of Schemes as on Dec 31, 2025")—those are single-point metrics, not time-series columns to melt.
+1. date_columns: List ONLY columns whose HEADER VALUE itself is a specific period/year to melt from wide to long format (e.g. "2011-12", "2012-13", "Q1 2024", "Jan-2023", "Apr-2023"). These are columns where each header IS a time point and the cell values are the metric.
+   CRITICAL: Do NOT include columns whose header is a GENERIC LABEL like "Month", "Year", "Date", "Period", "Quarter" — even if the row values underneath them are months or years. Those are regular data columns, not date headers to melt. Only melt when the column header text IS a specific date/time period.
+   Leave date_columns EMPTY if columns are metric names that merely mention a date in the description (e.g. "Funds Mobilised for the month of Dec 2025 (INR in crore)" or "No. of Schemes as on Dec 31, 2025")—those are single-point metrics, not time-series columns to melt.
 2. Detect if headers span multiple levels and need merging. This includes:
    - Pandas MultiIndex columns
    - First few rows containing header information (e.g., "Unit value index" spanning multiple columns)
@@ -94,7 +96,8 @@ Respond in JSON format:
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.3
+                temperature=0,
+                seed=42
             )
             
             analysis = json.loads(response.choices[0].message.content)
@@ -229,7 +232,8 @@ Respond in JSON format:
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.3
+                temperature=0,
+                seed=42
             )
             
             result = json.loads(response.choices[0].message.content)
@@ -317,7 +321,8 @@ Example: {{"column_name": "VARCHAR(200)", "amount": "NUMERIC(15, 2)", "date": "T
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.2
+                temperature=0,
+                seed=42
             )
             
             result = json.loads(response.choices[0].message.content)
@@ -393,7 +398,8 @@ Respond with ONLY a single number: 1, 2, or 3"""
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.0  # Reduced from 0.1 for more deterministic output
+                temperature=0.0,
+                seed=42
             )
             header_count = int(response.choices[0].message.content.strip())
             if header_count not in [1, 2, 3]:
@@ -455,7 +461,8 @@ Return JSON: {{"table_name": "...", "reasoning": "..."}}"""
                     {"role": "user", "content": retry_prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.3
+                temperature=0,
+                seed=42
             )
             result = json.loads(response.choices[0].message.content)
             refined = result.get("table_name", table_name).lower()
@@ -493,7 +500,8 @@ Return ONLY the shortened name, nothing else."""
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2
+                temperature=0,
+                seed=42
             )
             refined = response.choices[0].message.content.strip().lower()
             if len(refined) > 50:
@@ -517,15 +525,25 @@ Return ONLY the shortened name, nothing else."""
         try:
             prompt = f"""You are normalizing column names for a database table. Your goals:
 1. Produce clear, semantic snake_case names (lowercase, underscores, max 50 chars).
-2. Remove redundant columns: when two or more columns carry the same semantic meaning or identical values, keep ONE with a canonical name and list the others in "drop_columns".
-3. Optionally drop metadata-only columns (e.g. ingestion timestamp, refresh_date) if they add no analytical value; otherwise keep with a clear name.
+2. Remove ONLY truly redundant columns: columns that have identical values in every row (exact duplicates). List those in "drop_columns".
+3. Do NOT drop columns that represent different aspects or formats of the same concept. For example:
+   - A numeric month column (1-12) and a text month name column (JAN, FEB) are NOT redundant — keep BOTH.
+   - year vs month are NOT redundant.
+   - A column with a unit qualifier vs one without are NOT redundant.
+4. Optionally drop metadata-only columns (e.g. ingestion timestamp, refresh_date) if they add no analytical value; otherwise keep with a clear name.
+
+IMPORTANT COLUMN NAMING RULES:
+- A column containing numeric month values (1-12) MUST be named "month_numeric".
+- A column containing text month names (JAN, FEB, January, etc.) should be named "month_name".
+- NEVER drop columns named month_numeric, month_name, month, year, period, or state.
+- NEVER put month_numeric in drop_columns.
 
 INPUT COLUMNS:
 {json.dumps(columns, indent=2)}
 """
             if sample_rows:
                 prompt += f"""
-SAMPLE ROW DATA (use to detect redundant columns—e.g. same values in two columns = duplicate):
+SAMPLE ROW DATA (use to detect redundant columns — ONLY drop if two columns have literally identical values in every row):
 {json.dumps(sample_rows[:3], indent=2, default=str)}
 """
             prompt += """
@@ -575,6 +593,10 @@ CRITICAL RULES:
 - Max 50 characters per name
 - Use snake_case, lowercase only
 - Economics/financial context
+- A column with numeric month values (1-12) MUST be named "month_numeric" (NOT "month")
+- A column with text month names (JAN, FEB, January, etc.) should be named "month_name"
+- NEVER put month_numeric, month_name, month, year, period, state, value, or total in "drop_columns"
+- When in doubt, keep a column — do NOT drop it
 
 FULL INPUT/OUTPUT EXAMPLE:
 
@@ -599,7 +621,8 @@ Return ONLY a JSON object with exactly two keys: "mapping" and "drop_columns".
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                temperature=0.1,
+                temperature=0,
+                seed=42
             )
             raw = response.choices[0].message.content
             if not raw:
