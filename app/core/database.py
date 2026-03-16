@@ -175,6 +175,40 @@ class DatabaseManager:
                 logger.warning(f"Could not normalize date column '{col}': {e}")
         return df
 
+    def _normalize_numeric_columns(self, df: pd.DataFrame, column_types: Dict[str, str]) -> pd.DataFrame:
+        """
+        Normalize numeric columns by coercing common placeholder tokens
+        (e.g. '-', 'NA') to NULL so PostgreSQL numeric inserts do not fail.
+        """
+        numeric_type_keywords = ('NUMERIC', 'DECIMAL', 'REAL', 'DOUBLE', 'FLOAT', 'INT')
+        placeholder_tokens = {
+            '', '-', '--', '—', '–', 'na', 'n/a', 'nan', 'null', 'none'
+        }
+
+        for col, col_type in column_types.items():
+            if col not in df.columns:
+                continue
+            if not any(kw in col_type.upper() for kw in numeric_type_keywords):
+                continue
+
+            try:
+                series = df[col]
+
+                # Work with strings only for token cleanup, preserving nulls.
+                normalized = series.where(series.isna(), series.astype(str).str.strip())
+                lowered = normalized.where(normalized.isna(), normalized.str.lower())
+                normalized = normalized.where(~lowered.isin(placeholder_tokens), None)
+
+                # Convert all remaining values to numeric; invalid values become NULL.
+                numeric_vals = pd.to_numeric(normalized, errors='coerce')
+                df[col] = numeric_vals.where(numeric_vals.notna(), other=None)
+
+                logger.info(f"Normalized numeric column '{col}' for DB insertion")
+            except Exception as e:
+                logger.warning(f"Could not normalize numeric column '{col}': {e}")
+
+        return df
+
     def _widen_narrow_varchars(self, table_name: str, df: pd.DataFrame, column_types: Dict[str, str]) -> None:
         """
         Before insertion, check every VARCHAR(n) column: if the data contains values
@@ -341,6 +375,7 @@ class DatabaseManager:
         try:
             if column_types:
                 df = self._normalize_date_columns(df.copy(), column_types)
+                df = self._normalize_numeric_columns(df, column_types)
                 self._widen_narrow_varchars(table_name, df, column_types)
 
             # Prepare column names and data
@@ -744,6 +779,7 @@ class DatabaseManager:
 
         if column_types:
             df = self._normalize_date_columns(df.copy(), column_types)
+            df = self._normalize_numeric_columns(df, column_types)
             self._widen_narrow_varchars(table_name, df, column_types)
 
         # Stamp ingested_at for every row
