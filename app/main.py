@@ -586,6 +586,41 @@ async def preprocess_file(
         )
 
 
+def _generate_non_colliding_table_name_via_llm(
+    df: pd.DataFrame,
+    analysis: dict,
+    file_description: Optional[str],
+    filename_stem: str,
+    existing_name: str,
+) -> str:
+    """
+    Generate a different, meaningful table name when LLM collides with
+    an existing DB table in a non-incremental flow.
+    """
+    for _ in range(3):
+        collision_hint = (
+            (file_description or "")
+            + f" Existing table name '{existing_name}' already exists. "
+            + "Generate a DIFFERENT name for a new one-time-load dataset. "
+            + "Do not return the existing table name."
+        ).strip()
+
+        candidate = llm_architect.generate_table_name(
+            df,
+            analysis,
+            collision_hint,
+            filename=filename_stem,
+        )
+        candidate = llm_architect.refine_table_name(candidate)
+
+        if candidate and candidate != existing_name and not db_manager.table_exists(candidate):
+            return candidate
+
+    # Final fallback: still non-numeric-sequence naming, uniquely timestamped.
+    fallback = f"{existing_name}_new_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    return llm_architect.refine_table_name(fallback)
+
+
 async def _preprocess_file_inner(
     job_id: str,
     file_path: str,
@@ -605,6 +640,8 @@ async def _preprocess_file_inner(
     )
     
     try:
+        table_name_generated_by_llm = False
+
         # Step 1: Smart header detection
         logger.info(f"[Job {job_id}] Loading file for header detection: {file_path}")
         
@@ -787,6 +824,7 @@ async def _preprocess_file_inner(
         else:
             logger.info(f"[Job {job_id}] Generating table name with LLM")
             table_name = llm_architect.generate_table_name(df, analysis, file_description, filename=Path(file_path).stem)
+            table_name_generated_by_llm = True
 
             # Step 3b: Refine table name if too long
             table_name = llm_architect.refine_table_name(table_name)
@@ -1401,6 +1439,25 @@ async def _preprocess_file_inner(
                         f"[Job {job_id}] No matches found (Milvus + column fallback + peer jobs). "
                         "Proceeding with One-Time Load (OTL)."
                     )
+
+        # Non-incremental safeguard: if LLM generated a table name that already
+        # exists in DB, generate a unique OTL name to avoid accidental collision.
+        job = job_manager.get_job(job_id)
+        il_statuses = {JobStatus.SCHEMA_MISMATCH, JobStatus.DUPLICATE_DATA_DETECTED}
+        is_incremental_path = job.status in il_statuses if job else False
+        if table_name_generated_by_llm and not is_incremental_path and db_manager.table_exists(table_name):
+            original_table_name = table_name
+            table_name = _generate_non_colliding_table_name_via_llm(
+                df=df,
+                analysis=analysis,
+                file_description=file_description,
+                filename_stem=Path(file_path).stem,
+                existing_name=table_name,
+            )
+            logger.warning(
+                f"[Job {job_id}] LLM generated existing table name '{original_table_name}' "
+                f"for non-incremental flow. Renamed to '{table_name}'."
+            )
 
         # Step 10: Store preprocessing results
         job_manager.set_preprocessing_results(
