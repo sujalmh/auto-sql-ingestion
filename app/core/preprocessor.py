@@ -4,6 +4,17 @@ from datetime import date
 from typing import Dict, List, Optional
 from app.core.logger import logger
 
+# Footer patterns for detecting footnote/notes rows at the bottom of data
+_FOOTER_RE = re.compile(
+    r"^\s*(notes?\s*:|source\s*:|"
+    r"\*|@|#|†|‡|§|"
+    r"\d+\.\s+[A-Z]|"
+    r"p\s*[-–:]\s*provisional|"
+    r"re\s*[-–:]\s*revised|"
+    r"be\s*[-–:]\s*budget)",
+    re.IGNORECASE,
+)
+
 
 class DataPreprocessor:
     """
@@ -47,20 +58,21 @@ class DataPreprocessor:
     def _merge_multiindex_columns(self, columns: pd.MultiIndex) -> list:
         """
         Merge pandas MultiIndex columns into single-level names.
-        
-        Args:
-            columns: MultiIndex columns
-            
-        Returns:
-            List of merged column names
+        Drops 'Unnamed:*' level entries (artifacts of empty cells) and
+        joins the remaining parts with underscores.
         """
         merged = []
         for col in columns:
-            # Filter out empty/unnamed levels and join with underscore
-            parts = [str(part).strip() for part in col if str(part).strip() and not str(part).startswith('Unnamed')]
+            parts = [
+                str(part).strip()
+                for part in col
+                if str(part).strip()
+                and not str(part).startswith('Unnamed')
+                and str(part).strip().lower() != 'nan'
+            ]
             merged_name = '_'.join(parts) if parts else 'unnamed_column'
             merged.append(merged_name)
-        
+
         logger.info(f"Merged {len(columns)} MultiIndex columns")
         return merged
     
@@ -238,6 +250,47 @@ class DataPreprocessor:
             logger.warning(f"Could not parse period column: {str(e)}")
             return period_series
     
+    def remove_footer_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Remove footnote/notes rows from the bottom of the DataFrame.
+        Scans from the last row upward looking for patterns like
+        'Notes:', 'Source:', numbered footnotes, or long single-cell text.
+        """
+        if df.empty:
+            return df
+
+        drop_indices = []
+        for idx in reversed(df.index):
+            row = df.loc[idx]
+            non_null = row.dropna()
+            non_empty = non_null[non_null.astype(str).str.strip() != '']
+
+            # Fully empty row — mark for drop and keep scanning
+            if len(non_empty) == 0:
+                drop_indices.append(idx)
+                continue
+
+            first_val = str(non_empty.iloc[0]).strip()
+
+            # Matches footer patterns (Notes:, Source:, numbered footnotes, etc.)
+            if _FOOTER_RE.match(first_val):
+                drop_indices.append(idx)
+                continue
+
+            # Single long text in 1-2 cells = likely a footnote
+            if len(non_empty) <= 2 and len(first_val) > 60:
+                drop_indices.append(idx)
+                continue
+
+            # Not a footer row — stop scanning
+            break
+
+        if drop_indices:
+            df = df.drop(index=drop_indices)
+            logger.info(f"Removed {len(drop_indices)} footer/note rows from bottom")
+
+        return df
+
     def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         General data cleaning operations.
@@ -279,6 +332,14 @@ class DataPreprocessor:
         
         # Remove completely empty rows
         df = df.dropna(how='all')
+        
+        # Remove mostly-empty rows (>80% NaN) — catches stray separator rows
+        if len(df.columns) >= 3:
+            thresh = max(int(len(df.columns) * 0.2), 1)  # keep if >= 20% non-null
+            df = df.dropna(thresh=thresh)
+        
+        # Remove footer/footnote rows that may have survived
+        df = self.remove_footer_rows(df)
         
         # Clean column names: remove special characters, replace spaces with underscores
         df.columns = [self._clean_column_name(col) for col in df.columns]
@@ -323,7 +384,8 @@ class DataPreprocessor:
         
         # Remove common annotations/suffixes
         # e.g., "Year - ending March" -> "Year"
-        name = re.sub(r'\s*[-–—]\s*.*$', '', name)
+        # Only match dashes surrounded by spaces (separators), not word-internal hyphens
+        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         
         # Convert to lowercase
         name = name.lower()

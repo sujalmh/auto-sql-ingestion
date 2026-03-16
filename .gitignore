@@ -104,3 +104,5 @@ test_deletion_flow.py
 # Local test scripts
 test_*.py
 restart.sh
+check_names.py
+resp*.json

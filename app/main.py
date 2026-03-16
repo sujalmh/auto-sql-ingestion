@@ -34,6 +34,7 @@ from app.core.schema_validator import schema_validator
 from app.core.incremental_loader import incremental_loader
 from app.core.category_classifier import category_classifier
 from app.core.cat2_preprocessor import cat2_preprocessor
+from app.core.excel_analyzer import excel_analyzer
 from app.config import settings
 
 
@@ -607,7 +608,8 @@ async def _preprocess_file_inner(
         # Step 1: Smart header detection
         logger.info(f"[Job {job_id}] Loading file for header detection: {file_path}")
         
-        # Load first 5 rows without assuming header structure
+        excel_structure = None  # Will be set for .xlsx files
+        
         if file_path.endswith('.csv'):
             # Robust CSV delimiter detection.
             # 1. Check for an explicit "sep=X" metadata directive on line 1
@@ -653,41 +655,124 @@ async def _preprocess_file_inner(
             except Exception as e:
                 logger.warning(f"[Job {job_id}] Could not detect delimiter, defaulting to comma: {e}")
 
+            # Load first 5 rows without assuming header structure
             df_preview = pd.read_csv(
                 file_path, header=None, nrows=5, sep=detected_delimiter, skiprows=skip_rows
             )
-        else:
-            df_preview = pd.read_excel(file_path, header=None, nrows=5)
-        
-        # Ask LLM to detect header row count
-        header_count = llm_architect.detect_header_rows(df_preview)
-        logger.info(f"[Job {job_id}] Detected {header_count} header row(s)")
-        
-        # Re-load file with correct header parameter
-        if header_count == 1:
-            # Single header row
-            if file_path.endswith('.csv'):
+            
+            # Ask LLM to detect header row count
+            header_count = llm_architect.detect_header_rows(df_preview)
+            logger.info(f"[Job {job_id}] Detected {header_count} header row(s)")
+            
+            # Re-load file with correct header parameter
+            if header_count == 1:
                 df = pd.read_csv(file_path, sep=detected_delimiter, skiprows=skip_rows)
-            else:
-                df = pd.read_excel(file_path)
-        elif header_count == 2:
-            # Two header rows
-            if file_path.endswith('.csv'):
+            elif header_count == 2:
                 df = pd.read_csv(file_path, header=[0, 1], sep=detected_delimiter, skiprows=skip_rows)
-            else:
-                df = pd.read_excel(file_path, header=[0, 1])
-        else:  # header_count == 3
-            # Three header rows
-            if file_path.endswith('.csv'):
+            else:  # header_count == 3
                 df = pd.read_csv(file_path, header=[0, 1, 2], sep=detected_delimiter, skiprows=skip_rows)
+        else:
+            # ── Excel file: use openpyxl-based structural analysis ──
+            excel_structure = excel_analyzer.analyze(file_path)
+            es = excel_structure
+            logger.info(
+                f"[Job {job_id}] Excel structure: skip={es.skip_rows}, "
+                f"headers={es.header_rows}, col_num_row={es.col_number_row}, "
+                f"data={es.data_start_row}-{es.data_end_row}, "
+                f"footer={es.footer_start_row}"
+            )
+            
+            # Compute pandas parameters from ExcelStructure
+            # skip_rows = rows before the first header (title/unit/blanks)
+            pandas_skiprows = list(range(0, es.skip_rows))  # 0-indexed
+            
+            # If there's a column-numbering row between headers & data, skip it too
+            if es.col_number_row is not None:
+                pandas_skiprows.append(es.col_number_row - 1)  # convert 1-indexed → 0-indexed
+            
+            # If there are footer rows, limit the number of data rows we read
+            nrows_param = None
+            if es.footer_start_row is not None:
+                # Total rows to read = from first header row to last data row
+                total_rows = es.data_end_row - es.header_rows[0] + 1
+                # Subtract the column-numbering row if present and within this range 
+                if es.col_number_row is not None and es.header_rows[0] <= es.col_number_row <= es.data_end_row:
+                    total_rows -= 1
+                # Subtract header rows (pandas uses them as column names)
+                total_rows -= es.num_header_rows
+                nrows_param = max(total_rows, 0)
+            
+            # Build header parameter: list of 0-indexed row positions
+            # relative to the rows pandas will see AFTER skipping pandas_skiprows
+            # Since we skip title rows, the header rows become the first rows pandas sees
+            if es.num_header_rows == 1:
+                header_param = 0
             else:
-                df = pd.read_excel(file_path, header=[0, 1, 2])
+                header_param = list(range(es.num_header_rows))
+            
+            logger.info(
+                f"[Job {job_id}] pd.read_excel params: skiprows={pandas_skiprows}, "
+                f"header={header_param}, nrows={nrows_param}"
+            )
+            
+            if nrows_param is not None:
+                df = pd.read_excel(
+                    file_path,
+                    skiprows=pandas_skiprows,
+                    header=header_param,
+                    nrows=nrows_param,
+                )
+            else:
+                df = pd.read_excel(
+                    file_path,
+                    skiprows=pandas_skiprows,
+                    header=header_param,
+                )
+            
+            # Drop fully empty leading columns (data often starts at col B)
+            while len(df.columns) > 0:
+                first_col = df.iloc[:, 0]
+                if first_col.isna().all() or (first_col.astype(str).str.strip() == '').all():
+                    df = df.iloc[:, 1:]
+                else:
+                    break
+            
+            # If we have multi-level headers, replace pandas' broken MultiIndex
+            # with properly merged names from the ExcelAnalyzer
+            if es.num_header_rows > 1 and es.merged_header_values and isinstance(df.columns, pd.MultiIndex):
+                merged_names = []
+                num_cols = len(df.columns)
+                # Align: the merged_header_values cover min_data_col..max_data_col,
+                # but after dropping empty leading columns, df may have fewer columns.
+                # The merged_header_values has (max_data_col - min_data_col + 1) entries.
+                header_grid = es.merged_header_values
+                # After dropping empty leading columns, df has exactly the data columns
+                for col_idx in range(num_cols):
+                    parts = []
+                    seen = set()
+                    for level in header_grid:
+                        if col_idx < len(level):
+                            val = level[col_idx]
+                            if val and val not in seen:
+                                parts.append(val)
+                                seen.add(val)
+                    merged_names.append('_'.join(parts) if parts else f'column_{col_idx}')
+                df.columns = merged_names
+                logger.info(f"[Job {job_id}] Applied merged column names from Excel structure: {merged_names}")
         
         logger.info(f"[Job {job_id}] Loaded {df.shape[0]} rows × {df.shape[1]} columns")
         
         # Step 2: Analyze file structure with LLM
         logger.info(f"[Job {job_id}] Analyzing file structure with LLM")
         analysis = llm_architect.analyze_file_structure(df)
+        
+        # Inject Excel-level metadata into analysis if available
+        if excel_structure:
+            if excel_structure.title_hint:
+                analysis["excel_title"] = excel_structure.title_hint
+            if excel_structure.unit_hint:
+                analysis["excel_unit"] = excel_structure.unit_hint
+        
         logger.info(f"[Job {job_id}] Analysis complete: {analysis}")
         
         # Step 2b: Classify as Category 1 or 2 (row-structure complexity)

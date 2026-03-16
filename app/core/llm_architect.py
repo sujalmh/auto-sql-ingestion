@@ -169,6 +169,12 @@ Canonical Abbreviation Map (use these consistently, all lowercase):
   gst_state_mth_sector            — GST State-wise Monthly at Sector grain
   fiscal_deficit_india_mth        — Fiscal Deficit India Monthly
   insurance_premium_india_yr_catg — Insurance Premium India Yearly at Category
+  state_expenditure_yr_sector     — State Government Expenditure Yearly by Sector
+  state_deficit_indicators_yr     — State Government Deficit Indicators Yearly
+  state_fiscal_pct_gdp_yr         — State Fiscal Indicators (% of GDP) Yearly
+  state_gfd_financing_yr          — State Gross Fiscal Deficit & Financing Yearly
+  state_liabilities_yr_instrument — State Outstanding Liabilities by Instrument
+  equity_issue_india_yr_instrument— Equity Issues (IPO/FPO/Rights) India Yearly
 
 ─── BAD examples (vague, never produce these) ───
   data_india_yr           ❌  "data" is meaningless
@@ -191,6 +197,12 @@ Canonical Abbreviation Map (use these consistently, all lowercase):
         
         # Build optional context sections
         extra_context = ""
+        excel_title = analysis.get('excel_title', '')
+        excel_unit = analysis.get('excel_unit', '')
+        if excel_title:
+            extra_context += f"\nDataset title (from the Excel sheet): {excel_title}"
+        if excel_unit:
+            extra_context += f"\nUnit of measurement: {excel_unit}"
         if file_description:
             extra_context += f"\nUser-provided context: {file_description}"
         if filename:
@@ -209,14 +221,23 @@ Data Analysis:
 
 CRITICAL RULES:
 1. The <domain> segment MUST specifically identify the dataset — NOT a generic
-   category.  Look at the column names, sample values, and filename to determine
-   exactly what indicator/metric this data represents.
+   category.  Look at the column names, sample values, the dataset title, and
+   filename to determine exactly what indicator/metric this data represents.
 2. The name MUST be all lowercase snake_case.
 3. Use the canonical abbreviation map — do NOT invent your own abbreviations.
 4. Omit optional segments only when the data truly has no geographic, temporal,
    or dimensional breakdown.
 5. A good table name should let someone understand what data is in the table
    WITHOUT looking at the data itself.
+6. Pay close attention to the geographic scope in the dataset title:
+   - "State Governments" or "States" → use "state" as the <geo> segment
+   - "India" or national-level data → use "india" as the <geo> segment
+   - If the data is an ALL-INDIA aggregate of state governments
+     (no state-wise breakdown), still use "state" since it describes
+     state government finances/indicators.
+7. If the dataset title mentions a SPECIFIC context like "As Percentage of GDP",
+   encode that distinction in the <domain> segment (e.g., "fiscal_pct_gdp")
+   to avoid name collisions with similar datasets in absolute values.
 
 Respond in JSON format:
 {{
