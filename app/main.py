@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Optional
 import asyncio
+import re
 import pandas as pd
 import shutil
 from datetime import datetime
@@ -34,7 +35,7 @@ from app.core.schema_validator import schema_validator
 from app.core.incremental_loader import incremental_loader
 from app.core.category_classifier import category_classifier
 from app.core.cat2_preprocessor import cat2_preprocessor
-from app.core.excel_analyzer import excel_analyzer
+from app.core.excel_analyzer import excel_analyzer, WorkbookStructure
 from app.config import settings
 
 
@@ -621,6 +622,56 @@ def _generate_non_colliding_table_name_via_llm(
     return llm_architect.refine_table_name(fallback)
 
 
+def _load_sub_table_df(file_path: str, sub, job_id: str) -> pd.DataFrame:
+    """Load a single SubTable from an Excel workbook as a DataFrame."""
+    # Skip all rows before the first header row (0-indexed)
+    skiprows = list(range(0, sub.header_rows[0] - 1))
+    # Also skip the column-numbering row if present
+    if sub.col_number_row is not None:
+        skiprows.append(sub.col_number_row - 1)
+
+    header_param = 0 if sub.num_header_rows == 1 else list(range(sub.num_header_rows))
+    nrows = sub.data_end_row - sub.data_start_row + 1
+
+    df = pd.read_excel(
+        file_path,
+        sheet_name=sub.sheet_name,
+        skiprows=skiprows,
+        header=header_param,
+        nrows=nrows,
+    )
+
+    # Drop fully empty leading columns
+    while len(df.columns) > 0:
+        first_col = df.iloc[:, 0]
+        if first_col.isna().all() or (first_col.astype(str).str.strip() == '').all():
+            df = df.iloc[:, 1:]
+        else:
+            break
+
+    # Replace broken MultiIndex with merged header names
+    if sub.num_header_rows > 1 and sub.merged_header_values and isinstance(df.columns, pd.MultiIndex):
+        merged_names = []
+        for col_idx in range(len(df.columns)):
+            parts = []
+            seen = set()
+            for level in sub.merged_header_values:
+                if col_idx < len(level) and level[col_idx]:
+                    val = level[col_idx]
+                    if val not in seen:
+                        parts.append(val)
+                        seen.add(val)
+            merged_names.append("_".join(parts) if parts else f"column_{col_idx}")
+        df.columns = merged_names
+
+    logger.info(
+        f"[Job {job_id}] Loaded sub-table [{sub.sheet_name}] "
+        f"rows {sub.data_start_row}-{sub.data_end_row}: "
+        f"{df.shape[0]}x{df.shape[1]}, base_year={sub.base_year}, label={sub.label}"
+    )
+    return df
+
+
 async def _preprocess_file_inner(
     job_id: str,
     file_path: str,
@@ -710,92 +761,129 @@ async def _preprocess_file_inner(
                 df = pd.read_csv(file_path, header=[0, 1, 2], sep=detected_delimiter, skiprows=skip_rows)
         else:
             # ── Excel file: use openpyxl-based structural analysis ──
-            excel_structure = excel_analyzer.analyze(file_path)
-            es = excel_structure
+            # First check for multi-sheet / vertically-stacked sub-table patterns
+            wb_structure = excel_analyzer.analyze_workbook(file_path)
             logger.info(
-                f"[Job {job_id}] Excel structure: skip={es.skip_rows}, "
-                f"headers={es.header_rows}, col_num_row={es.col_number_row}, "
-                f"data={es.data_start_row}-{es.data_end_row}, "
-                f"footer={es.footer_start_row}"
+                f"[Job {job_id}] Workbook: {len(wb_structure.sub_tables)} sub-tables "
+                f"across {len(wb_structure.sheet_names)} sheets, "
+                f"mergeable={wb_structure.mergeable}"
             )
-            
-            # Compute pandas parameters from ExcelStructure
-            # skip_rows = rows before the first header (title/unit/blanks)
-            pandas_skiprows = list(range(0, es.skip_rows))  # 0-indexed
-            
-            # If there's a column-numbering row between headers & data, skip it too
-            if es.col_number_row is not None:
-                pandas_skiprows.append(es.col_number_row - 1)  # convert 1-indexed → 0-indexed
-            
-            # If there are footer rows, limit the number of data rows we read
-            nrows_param = None
-            if es.footer_start_row is not None:
-                # Total rows to read = from first header row to last data row
-                total_rows = es.data_end_row - es.header_rows[0] + 1
-                # Subtract the column-numbering row if present and within this range 
-                if es.col_number_row is not None and es.header_rows[0] <= es.col_number_row <= es.data_end_row:
-                    total_rows -= 1
-                # Subtract header rows (pandas uses them as column names)
-                total_rows -= es.num_header_rows
-                nrows_param = max(total_rows, 0)
-            
-            # Build header parameter: list of 0-indexed row positions
-            # relative to the rows pandas will see AFTER skipping pandas_skiprows
-            # Since we skip title rows, the header rows become the first rows pandas sees
-            if es.num_header_rows == 1:
-                header_param = 0
-            else:
-                header_param = list(range(es.num_header_rows))
-            
-            logger.info(
-                f"[Job {job_id}] pd.read_excel params: skiprows={pandas_skiprows}, "
-                f"header={header_param}, nrows={nrows_param}"
-            )
-            
-            if nrows_param is not None:
-                df = pd.read_excel(
-                    file_path,
-                    skiprows=pandas_skiprows,
-                    header=header_param,
-                    nrows=nrows_param,
+
+            if wb_structure.mergeable and len(wb_structure.sub_tables) > 1:
+                # ── Multiple sub-tables with same columns → load each, add labels, concat ──
+                _BY_RE = re.compile(r"(\d{4}(?:[–\-]\d{2,4})?)")
+                dfs = []
+                for sub in wb_structure.sub_tables:
+                    sub_df = _load_sub_table_df(file_path, sub, job_id)
+                    # Derive base_year from sheet name if not found in banners
+                    if not sub.base_year:
+                        by_m = _BY_RE.search(sub.sheet_name)
+                        if by_m:
+                            sub.base_year = by_m.group(1)
+                    # Add distinguishing columns
+                    if sub.base_year:
+                        sub_df.insert(0, "base_year", sub.base_year)
+                    if sub.label:
+                        pos = 1 if "base_year" in sub_df.columns else 0
+                        sub_df.insert(pos, "price_type", sub.label)
+                    # Fallback: use sheet name as distinguishing column
+                    if not sub.base_year and not sub.label:
+                        sub_df.insert(0, "sheet_label", sub.sheet_name)
+                    dfs.append(sub_df)
+
+                df = pd.concat(dfs, ignore_index=True)
+                logger.info(
+                    f"[Job {job_id}] Merged {len(dfs)} sub-tables: "
+                    f"{df.shape[0]} rows x {df.shape[1]} columns"
                 )
+                # Use workbook-level hints for downstream metadata injection
+                excel_structure = wb_structure
             else:
-                df = pd.read_excel(
-                    file_path,
-                    skiprows=pandas_skiprows,
-                    header=header_param,
-                )
-            
-            # Drop fully empty leading columns (data often starts at col B)
-            while len(df.columns) > 0:
-                first_col = df.iloc[:, 0]
-                if first_col.isna().all() or (first_col.astype(str).str.strip() == '').all():
-                    df = df.iloc[:, 1:]
+                # ── Single table (or non-mergeable): use original single-table flow ──
+                # When sub-tables exist but aren't mergeable, load only the first
+                # sub-table to avoid confusing the row classifier with mixed data.
+                if wb_structure.sub_tables:
+                    first_sub = wb_structure.sub_tables[0]
+                    df = _load_sub_table_df(file_path, first_sub, job_id)
+                    logger.info(
+                        f"[Job {job_id}] Non-mergeable: loaded first sub-table "
+                        f"[{first_sub.sheet_name}] rows {first_sub.data_start_row}-"
+                        f"{first_sub.data_end_row}: {df.shape[0]}x{df.shape[1]}"
+                    )
+                    excel_structure = wb_structure
                 else:
-                    break
-            
-            # If we have multi-level headers, replace pandas' broken MultiIndex
-            # with properly merged names from the ExcelAnalyzer
-            if es.num_header_rows > 1 and es.merged_header_values and isinstance(df.columns, pd.MultiIndex):
-                merged_names = []
-                num_cols = len(df.columns)
-                # Align: the merged_header_values cover min_data_col..max_data_col,
-                # but after dropping empty leading columns, df may have fewer columns.
-                # The merged_header_values has (max_data_col - min_data_col + 1) entries.
-                header_grid = es.merged_header_values
-                # After dropping empty leading columns, df has exactly the data columns
-                for col_idx in range(num_cols):
-                    parts = []
-                    seen = set()
-                    for level in header_grid:
-                        if col_idx < len(level):
-                            val = level[col_idx]
-                            if val and val not in seen:
-                                parts.append(val)
-                                seen.add(val)
-                    merged_names.append('_'.join(parts) if parts else f'column_{col_idx}')
-                df.columns = merged_names
-                logger.info(f"[Job {job_id}] Applied merged column names from Excel structure: {merged_names}")
+                    excel_structure = excel_analyzer.analyze(file_path)
+                    es = excel_structure
+                    logger.info(
+                        f"[Job {job_id}] Excel structure: skip={es.skip_rows}, "
+                        f"headers={es.header_rows}, col_num_row={es.col_number_row}, "
+                        f"data={es.data_start_row}-{es.data_end_row}, "
+                        f"footer={es.footer_start_row}"
+                    )
+                    
+                    # Compute pandas parameters from ExcelStructure
+                    pandas_skiprows = list(range(0, es.skip_rows))  # 0-indexed
+                    
+                    if es.col_number_row is not None:
+                        pandas_skiprows.append(es.col_number_row - 1)
+                    
+                    nrows_param = None
+                    if es.footer_start_row is not None:
+                        total_rows = es.data_end_row - es.header_rows[0] + 1
+                        if es.col_number_row is not None and es.header_rows[0] <= es.col_number_row <= es.data_end_row:
+                            total_rows -= 1
+                        total_rows -= es.num_header_rows
+                        nrows_param = max(total_rows, 0)
+                    
+                    if es.num_header_rows == 1:
+                        header_param = 0
+                    else:
+                        header_param = list(range(es.num_header_rows))
+                    
+                    logger.info(
+                        f"[Job {job_id}] pd.read_excel params: skiprows={pandas_skiprows}, "
+                        f"header={header_param}, nrows={nrows_param}"
+                    )
+                    
+                    if nrows_param is not None:
+                        df = pd.read_excel(
+                            file_path,
+                            skiprows=pandas_skiprows,
+                            header=header_param,
+                            nrows=nrows_param,
+                        )
+                    else:
+                        df = pd.read_excel(
+                            file_path,
+                            skiprows=pandas_skiprows,
+                            header=header_param,
+                        )
+                    
+                    # Drop fully empty leading columns
+                    while len(df.columns) > 0:
+                        first_col = df.iloc[:, 0]
+                        if first_col.isna().all() or (first_col.astype(str).str.strip() == '').all():
+                            df = df.iloc[:, 1:]
+                        else:
+                            break
+                    
+                    # Replace broken MultiIndex with merged header names
+                    if es.num_header_rows > 1 and es.merged_header_values and isinstance(df.columns, pd.MultiIndex):
+                        merged_names = []
+                        num_cols = len(df.columns)
+                        header_grid = es.merged_header_values
+                        for col_idx in range(num_cols):
+                            parts = []
+                            seen = set()
+                            for level in header_grid:
+                                if col_idx < len(level):
+                                    val = level[col_idx]
+                                    if val and val not in seen:
+                                        parts.append(val)
+                                        seen.add(val)
+                            merged_names.append('_'.join(parts) if parts else f'column_{col_idx}')
+                        df.columns = merged_names
+                        logger.info(f"[Job {job_id}] Applied merged column names from Excel structure: {merged_names}")
         
         logger.info(f"[Job {job_id}] Loaded {df.shape[0]} rows × {df.shape[1]} columns")
         
@@ -813,8 +901,20 @@ async def _preprocess_file_inner(
         logger.info(f"[Job {job_id}] Analysis complete: {analysis}")
         
         # Step 2b: Classify as Category 1 or 2 (row-structure complexity)
-        classification = category_classifier.classify(df, analysis)
-        data_category = classification.get("category", 1)
+        # Force Category 1 for merged sub-table DataFrames — their row structure
+        # is already resolved by workbook-level analysis; Cat2 row classification
+        # misidentifies repeated state/entity names as group headers.
+        from_subtable = (
+            isinstance(excel_structure, WorkbookStructure)
+            and len(getattr(excel_structure, "sub_tables", [])) > 0
+        )
+        if from_subtable:
+            classification = {"category": 1, "confidence": 1.0, "reasoning": "Forced Cat1 — sub-table boundaries already determined by workbook analysis"}
+            data_category = 1
+            logger.info(f"[Job {job_id}] Forced Category 1 for workbook with known sub-table structure")
+        else:
+            classification = category_classifier.classify(df, analysis)
+            data_category = classification.get("category", 1)
         
         # Step 3: Determine table name
         if skip_llm_table_name and table_name_override:

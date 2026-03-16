@@ -6,15 +6,49 @@ footer/footnote rows, and data boundaries in complex Excel files
 BEFORE pandas loads them.  This avoids the common pitfall of pandas
 flattening merged cells into NaN-filled rows that confuse downstream
 header detection and LLM analysis.
+
+Also detects multi-sheet workbooks and vertically stacked sub-tables
+within a single sheet (e.g. same columns repeated under different
+"Base Year" banners or "Constant Prices" / "Current Prices" sections).
 """
 
 import re
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from app.core.logger import logger
+
+
+@dataclass
+class SubTable:
+    """One logical sub-table found inside a sheet."""
+    sheet_name: str
+    header_rows: List[int]            # 1-indexed
+    col_number_row: Optional[int]
+    data_start_row: int               # 1-indexed
+    data_end_row: int                 # 1-indexed
+    min_data_col: int
+    max_data_col: int
+    num_header_rows: int
+    merged_header_values: Optional[List[List[Optional[str]]]] = None
+    label: Optional[str] = None       # e.g. "Constant Prices", "Current Prices"
+    base_year: Optional[str] = None   # e.g. "2011-12", "2004-05"
+    unit_hint: Optional[str] = None
+
+
+@dataclass
+class WorkbookStructure:
+    """Result of full-workbook analysis."""
+    title_hint: Optional[str] = None
+    unit_hint: Optional[str] = None
+    sheet_names: List[str] = field(default_factory=list)
+    sub_tables: List[SubTable] = field(default_factory=list)
+    # True when all sub-tables share the same header columns and
+    # should be concatenated (with distinguishing columns) into one table.
+    mergeable: bool = False
 
 
 class ExcelStructure:
@@ -163,6 +197,284 @@ class ExcelAnalyzer:
         return structure
 
     # ── Private helpers ───────────────────────────────────────────────
+
+    # ── Regex for "Base Year" / price-type labels in sub-table banners ──
+    _BASE_YEAR_RE = re.compile(
+        r"base\s*year\s*[:=]?\s*(\d{4}(?:[–\-]\d{2,4})?)", re.IGNORECASE
+    )
+    _PRICE_LABEL_RE = re.compile(
+        r"\b(constant|current)\s+prices?\b", re.IGNORECASE
+    )
+
+    # ───────────────────────────────────────────────────────────────────
+    #  Whole-workbook analysis (multi-sheet + vertical sub-tables)
+    # ───────────────────────────────────────────────────────────────────
+
+    def analyze_workbook(self, file_path: str) -> WorkbookStructure:
+        """
+        Analyze every sheet in the workbook.  For each sheet, detect
+        vertically stacked sub-tables (same columns repeated under
+        different banners like "Base Year: 2004-05" or
+        "Constant Prices" / "Current Prices").
+
+        Returns a WorkbookStructure with a flat list of SubTable objects
+        and a `mergeable` flag indicating whether they can all be
+        concatenated into a single DataFrame (same column headers).
+        """
+        logger.info(f"ExcelAnalyzer.analyze_workbook: {file_path}")
+        wb = load_workbook(file_path, read_only=False, data_only=True)
+        result = WorkbookStructure(sheet_names=list(wb.sheetnames))
+
+        all_sub_tables: List[SubTable] = []
+        workbook_title: Optional[str] = None
+        workbook_unit: Optional[str] = None
+
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            max_row = ws.max_row or 1
+            max_col = ws.max_column or 1
+            if max_row < 2 or max_col < 2:
+                continue
+
+            merged_map = self._build_merged_map(ws)
+            grid = self._read_grid(ws, max_row, max_col, merged_map)
+
+            # Detect the title & unit once (from the first sheet that has them)
+            title, unit, _ = self._detect_title_rows(grid, max_row, max_col)
+            if title and not workbook_title:
+                workbook_title = title
+            if unit and not workbook_unit:
+                workbook_unit = unit
+
+            # Detect sub-tables in this sheet
+            subs = self._detect_sub_tables(grid, max_row, max_col, sheet_name)
+            # Propagate base_year from first sub-table to siblings in same sheet
+            if subs and subs[0].base_year:
+                sheet_base_year = subs[0].base_year
+                for s in subs[1:]:
+                    if not s.base_year:
+                        s.base_year = sheet_base_year
+            all_sub_tables.extend(subs)
+
+        wb.close()
+
+        result.title_hint = workbook_title
+        result.unit_hint = workbook_unit
+        result.sub_tables = all_sub_tables
+
+        # Decide mergeability: all sub-tables must have the same header
+        # column names (normalised) to be concat-able.
+        if len(all_sub_tables) > 1:
+            result.mergeable = self._check_mergeable(all_sub_tables)
+
+        logger.info(
+            f"ExcelAnalyzer.analyze_workbook: {len(all_sub_tables)} sub-tables "
+            f"across {len(wb.sheetnames)} sheets, mergeable={result.mergeable}"
+        )
+        return result
+
+    # ────────── Sub-table detection within a single sheet ──────────
+
+    def _detect_sub_tables(
+        self,
+        grid: List[List],
+        max_row: int,
+        max_col: int,
+        sheet_name: str,
+    ) -> List[SubTable]:
+        """
+        Scan a sheet's grid for one or more data tables separated by
+        empty-row gaps followed by banner / header rows.
+
+        A "banner" is a short row (1-2 cells) containing text like
+        "Base Year : 2004-05" or "Constant Prices" or "(Rupees Crores)".
+        """
+        sub_tables: List[SubTable] = []
+        cursor = 1  # current row being scanned (1-indexed)
+
+        while cursor <= max_row:
+            # Skip leading empty rows
+            while cursor <= max_row and self._is_empty_row(grid, cursor):
+                cursor += 1
+            if cursor > max_row:
+                break
+
+            # Collect banner metadata (base_year, label, unit) until we
+            # hit the first header row (many non-null string cells).
+            label: Optional[str] = None
+            base_year: Optional[str] = None
+            unit: Optional[str] = None
+            banner_start = cursor
+
+            while cursor <= max_row:
+                row = grid[cursor]
+                non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+                if len(non_null) == 0:
+                    cursor += 1
+                    continue
+
+                # Single-cell or double-cell row → banner / metadata
+                if len(non_null) <= 2:
+                    text = " ".join(str(v) for _, v in non_null).strip()
+                    by_m = self._BASE_YEAR_RE.search(text)
+                    if by_m:
+                        base_year = by_m.group(1)
+                    pl_m = self._PRICE_LABEL_RE.search(text)
+                    if pl_m:
+                        label = pl_m.group(1).title() + " Prices"
+                    if _UNIT_PATTERNS.search(text):
+                        unit = text.strip("() ")
+                    cursor += 1
+                    continue
+
+                # Merged cell spanning many columns → all values identical → banner
+                unique_vals = set(str(v) for _, v in non_null)
+                if len(unique_vals) == 1 and len(non_null) >= 3:
+                    text = str(non_null[0][1]).strip()
+                    by_m = self._BASE_YEAR_RE.search(text)
+                    if by_m:
+                        base_year = by_m.group(1)
+                    elif not base_year:
+                        # Fallback: year in parentheses like "(1999-00)"
+                        by_fb = re.search(r"\((\d{4}[–\-]\d{2,4})\)", text)
+                        if by_fb:
+                            base_year = by_fb.group(1)
+                    # Do NOT extract price label from wide merged rows (they are titles)
+                    if _UNIT_PATTERNS.search(text):
+                        unit = text.strip("() ")
+                    cursor += 1
+                    continue
+
+                # Header-like row (>=3 non-null, predominantly strings)
+                str_count = sum(
+                    1 for _, v in non_null
+                    if isinstance(v, str) and not _COL_NUMBER_RE.match(str(v).strip())
+                )
+                if str_count >= 3 or self._is_column_number_row(non_null):
+                    break
+                # Also break on numeric-dense rows (data rows)
+                num_count = sum(
+                    1 for _, v in non_null
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                )
+                if num_count >= 3:
+                    break
+                cursor += 1
+
+            if cursor > max_row:
+                break
+
+            # Now detect the header rows + column-number row + data range
+            header_rows, col_number_row = self._detect_headers(
+                grid, cursor, max_row, max_col
+            )
+            if not header_rows:
+                cursor += 1
+                continue
+
+            min_dc, max_dc = self._detect_col_range(grid, header_rows, max_col)
+            data_start = (col_number_row or header_rows[-1]) + 1
+            # Find data end: scan until an empty-row gap, a new banner, or footer
+            data_end = data_start
+            for r in range(data_start, max_row + 1):
+                row = grid[r]
+                non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+                if len(non_null) == 0:
+                    # Empty row → end of this sub-table's data
+                    data_end = r - 1
+                    break
+                # Check if this row looks like a new banner (1-2 cells, all strings)
+                if len(non_null) <= 2:
+                    text = " ".join(str(v) for _, v in non_null).strip()
+                    if (self._BASE_YEAR_RE.search(text)
+                            or self._PRICE_LABEL_RE.search(text)
+                            or _UNIT_PATTERNS.search(text)
+                            or _FOOTER_PATTERNS.match(text)):
+                        data_end = r - 1
+                        break
+                data_end = r
+
+            # Trim trailing empty rows within data_end
+            while data_end >= data_start and self._is_empty_row(grid, data_end):
+                data_end -= 1
+
+            if data_end < data_start:
+                cursor = data_end + 1
+                continue
+
+            merged_hdr = self._resolve_header_values(grid, header_rows, min_dc, max_dc)
+
+            sub = SubTable(
+                sheet_name=sheet_name,
+                header_rows=header_rows,
+                col_number_row=col_number_row,
+                data_start_row=data_start,
+                data_end_row=data_end,
+                min_data_col=min_dc,
+                max_data_col=max_dc,
+                num_header_rows=len(header_rows),
+                merged_header_values=merged_hdr,
+                label=label,
+                base_year=base_year,
+                unit_hint=unit,
+            )
+            sub_tables.append(sub)
+            logger.info(
+                f"ExcelAnalyzer: sub-table in [{sheet_name}] "
+                f"rows {data_start}-{data_end}, "
+                f"base_year={base_year}, label={label}"
+            )
+            cursor = data_end + 1
+
+        return sub_tables
+
+    def _is_empty_row(self, grid: List[List], r: int) -> bool:
+        if r < 1 or r >= len(grid):
+            return True
+        return all(v is None for v in grid[r][1:])
+
+    def _normalise_header(self, merged_vals: Optional[List[List[Optional[str]]]]) -> Tuple[str, ...]:
+        """Collapse multi-level headers into a normalised tuple for comparison."""
+        if not merged_vals:
+            return ()
+        names = []
+        for col_idx in range(len(merged_vals[0])):
+            parts = []
+            for level in merged_vals:
+                if col_idx < len(level) and level[col_idx]:
+                    part = re.sub(r"\s+", " ", level[col_idx].strip().lower())
+                    if part not in parts:
+                        parts.append(part)
+            names.append("_".join(parts))
+        return tuple(names)
+
+    def _check_mergeable(self, subs: List[SubTable]) -> bool:
+        """
+        Return True if all sub-tables share the same first column header
+        and have ≥50% overlap in column names (allowing for extra columns
+        in some sub-tables, e.g. newer states added in later base years).
+        """
+        if len(subs) <= 1:
+            return False
+        headers = [self._normalise_header(s.merged_header_values) for s in subs]
+        headers = [h for h in headers if h]
+        if not headers:
+            return False
+        # First column must match across all sub-tables
+        first_cols = [h[0] for h in headers]
+        if len(set(first_cols)) != 1:
+            return False
+        # Each sub-table must share ≥50% of its columns with at least
+        # one other sub-table (handles varying column counts)
+        col_sets = [set(h) for h in headers]
+        for i, s_i in enumerate(col_sets):
+            best_overlap = max(
+                len(s_i & s_j) / max(len(s_i), 1)
+                for j, s_j in enumerate(col_sets) if j != i
+            )
+            if best_overlap < 0.5:
+                return False
+        return True
 
     def _build_merged_map(self, ws) -> Dict[Tuple[int, int], Tuple[int, int]]:
         """
