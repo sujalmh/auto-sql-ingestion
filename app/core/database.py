@@ -119,9 +119,20 @@ class DatabaseManager:
         try:
             # Build CREATE TABLE statement
             columns_def = []
+            seen_sanitized = {}
             for col_name, col_type in column_types.items():
                 # Sanitize column name
                 safe_col_name = self._sanitize_identifier(col_name)
+                if safe_col_name in seen_sanitized:
+                    logger.error(
+                        "Sanitized column collision while creating table '%s': '%s' and '%s' both map to %s",
+                        table_name,
+                        seen_sanitized[safe_col_name],
+                        col_name,
+                        safe_col_name,
+                    )
+                    return False
+                seen_sanitized[safe_col_name] = col_name
                 columns_def.append(f"{safe_col_name} {col_type}")
             
             create_statement = f"""

@@ -557,6 +557,126 @@ async def reject_job(job_id: str):
     }
 
 
+@app.get("/pending-jobs")
+async def list_pending_jobs():
+    """
+    List all jobs that are awaiting approval (OTL, IL schema-mismatch,
+    or duplicate-data-detected).  Returns a lightweight summary per job
+    suitable for the batch-approve UI.
+    """
+    pending = job_manager.get_pending_jobs()
+    results = []
+    for job in pending:
+        load_type = "IL" if (job.is_incremental_load and job.matched_table_name) else "OTL"
+        table_name = job.matched_table_name if load_type == "IL" else job.proposed_table_name
+        total_rows = len(job.processed_df) if job.processed_df is not None else 0
+        columns_count = len(job.processed_df.columns) if job.processed_df is not None else 0
+        filename = Path(job.file_path).name if job.file_path else ""
+        results.append({
+            "job_id": job.job_id,
+            "filename": filename,
+            "proposed_table_name": table_name,
+            "load_type": load_type,
+            "status": job.status.value,
+            "total_rows": total_rows,
+            "columns_count": columns_count,
+            "created_at": job.created_at.isoformat(),
+        })
+    return {"pending_jobs": results}
+
+
+@app.post("/batch-approve")
+async def batch_approve(
+    background_tasks: BackgroundTasks,
+    source: str = Form(...),
+    source_url: str = Form(...),
+    released_on: str = Form(...),
+    updated_on: str = Form(...),
+    business_metadata: Optional[str] = Form(None),
+):
+    """
+    Approve **all** pending jobs at once with shared metadata.
+
+    The same source / source_url / dates are applied to every job that
+    is currently in an approvable status.
+    """
+    from dateutil import parser as date_parser
+    from app.models import MetadataInput
+
+    try:
+        released_on_parsed = date_parser.parse(released_on).isoformat()
+        updated_on_parsed = date_parser.parse(updated_on).isoformat()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+
+    metadata = MetadataInput(
+        source=source,
+        source_url=source_url,
+        released_on=released_on_parsed,
+        updated_on=updated_on_parsed,
+        business_metadata=business_metadata,
+    )
+
+    pending = job_manager.get_pending_jobs()
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending jobs to approve")
+
+    # Sort so OTL jobs are approved before their IL peers.
+    # OTL jobs have is_incremental_load=False; IL jobs True.
+    pending.sort(key=lambda j: (j.is_incremental_load, j.created_at))
+
+    approved: list[dict] = []
+    errors: list[dict] = []
+
+    for job in pending:
+        job_id = job.job_id
+        is_il = job.is_incremental_load and job.matched_table_name
+
+        # Peer-job guard for IL: skip if anchor not yet committed (it
+        # will be committed by the time the background task runs, since
+        # OTL jobs are sorted first, but validate anyway).
+        if is_il and job.peer_anchor_job_id:
+            anchor = job_manager.get_job(job.peer_anchor_job_id)
+            if anchor and anchor.status not in (
+                JobStatus.COMPLETED,
+                JobStatus.INCREMENTAL_LOAD_COMPLETED,
+                JobStatus.APPROVED,
+            ):
+                errors.append({
+                    "job_id": job_id,
+                    "error": (
+                        f"Peer anchor job {job.peer_anchor_job_id[:8]}... "
+                        f"not yet approved/completed. Skipped."
+                    ),
+                })
+                continue
+
+        final_table_name = job.matched_table_name if is_il else (job.proposed_table_name or "").lower()
+        job.table_name = final_table_name
+        job_manager.update_status(job_id, JobStatus.APPROVED)
+
+        if is_il:
+            background_tasks.add_task(
+                perform_incremental_load, job_id, job.matched_table_name, metadata
+            )
+        else:
+            background_tasks.add_task(
+                insert_to_database, job_id, final_table_name, metadata
+            )
+
+        approved.append({
+            "job_id": job_id,
+            "table_name": final_table_name,
+            "load_type": "incremental" if is_il else "one_time",
+        })
+
+    return {
+        "message": f"Batch approved {len(approved)} job(s).",
+        "approved": approved,
+        "errors": errors,
+    }
+
+
 # Background task functions
 
 async def preprocess_file(
@@ -1039,21 +1159,37 @@ async def _preprocess_phase_a(
             processed_df.rename(columns=rename_map, inplace=True)
             logger.info(f"[Job {job_id}] Columns after LLM cleaning: {processed_df.columns.tolist()}")
 
-            # Ensure unique column names (handle any remaining duplicates from LLM)
+            # Ensure unique column names (handle exact + case-insensitive collisions)
             cols = processed_df.columns.tolist()
-            seen = {}
+            seen_normalized = {}
             new_cols = []
             duplicates_found = []
+
+            def _norm_col_name(name: str) -> str:
+                # Match DB identifier normalization rules relevant for duplicates.
+                return str(name).replace('"', '').strip().lower()
+
             for idx, col in enumerate(cols):
-                if col in seen:
-                    seen[col] += 1
-                    suffix = str(seen[col])
-                    new_name = f"{col}_{suffix}"
-                    new_cols.append(new_name)
-                    duplicates_found.append((col, new_name, original_columns[idx] if idx < len(original_columns) else col))
+                col_str = str(col)
+                norm = _norm_col_name(col_str)
+                if norm in seen_normalized:
+                    seen_normalized[norm] += 1
+                    suffix = str(seen_normalized[norm])
+                    base = col_str.strip() or f"column_{idx}"
+                    candidate = f"{base}_{suffix}"
+                    candidate_norm = _norm_col_name(candidate)
+                    while candidate_norm in seen_normalized:
+                        seen_normalized[norm] += 1
+                        suffix = str(seen_normalized[norm])
+                        candidate = f"{base}_{suffix}"
+                        candidate_norm = _norm_col_name(candidate)
+
+                    new_cols.append(candidate)
+                    seen_normalized[candidate_norm] = 0
+                    duplicates_found.append((col_str, candidate, original_columns[idx] if idx < len(original_columns) else col_str))
                 else:
-                    seen[col] = 0
-                    new_cols.append(col)
+                    seen_normalized[norm] = 0
+                    new_cols.append(col_str)
             if duplicates_found:
                 processed_df.columns = new_cols
                 logger.warning(f"[Job {job_id}] Fixed {len(duplicates_found)} duplicate column names")

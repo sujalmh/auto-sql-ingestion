@@ -352,6 +352,24 @@ class JobManager:
         timeout_delta = timedelta(minutes=self.timeout_minutes)
         return datetime.now() - job.updated_at > timeout_delta
     
+    def get_pending_jobs(self) -> List[JobData]:
+        """
+        Return all jobs in an approvable status.
+
+        Returns:
+            List of JobData objects awaiting approval.
+        """
+        approvable = {
+            JobStatus.AWAITING_APPROVAL,
+            JobStatus.SCHEMA_MISMATCH,
+            JobStatus.DUPLICATE_DATA_DETECTED,
+        }
+        with self._lock:
+            return [
+                job for job in self._jobs.values()
+                if job.status in approvable
+            ]
+
     def cleanup_expired_jobs(self) -> int:
         """
         Remove expired jobs from the manager.
