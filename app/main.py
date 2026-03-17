@@ -274,6 +274,7 @@ async def get_status(job_id: str):
                 matching_columns=job.schema_validation['matching_columns'],
                 missing_columns=job.schema_validation['missing_columns'],
                 extra_columns=job.schema_validation['extra_columns'],
+                reconciled_columns=job.schema_validation.get('reconciled_columns', []),
                 discrepancy_report=schema_validator.generate_discrepancy_report(
                     job.schema_validation,
                     matched_table,
@@ -1448,18 +1449,13 @@ async def _preprocess_phase_b(
             is_additive_evolution = validation_result.get('is_additive_evolution', False)
 
             # Guard: reject the match if column overlap is too low
-            # Use the higher of raw and normalized percentages so that
-            # period-varying columns (e.g. _jan_2024 vs _feb_2025) don't
-            # falsely reduce the overlap score.
-            raw_pct = validation_result.get('match_percentage', 0.0)
-            norm_pct = validation_result.get('normalized_match_percentage', raw_pct)
-            match_pct = max(raw_pct, norm_pct)
+            # match_percentage now includes LLM-reconciled column pairs
+            match_pct = validation_result.get('match_percentage', 0.0)
             if match_pct < settings.schema_match_min_percentage:
                 logger.warning(
-                    f"[Job {job_id}] Schema overlap too low (raw={raw_pct:.1f}%, "
-                    f"normalized={norm_pct:.1f}% < "
-                    f"{settings.schema_match_min_percentage}%) for match '{matched_table_name}' "
-                    f"— treating as new table (OTL)"
+                    f"[Job {job_id}] Schema overlap too low "
+                    f"({match_pct:.1f}% < {settings.schema_match_min_percentage}%) "
+                    f"for match '{matched_table_name}' — treating as new table (OTL)"
                 )
                 similar_tables = []  # discard match — fall through to OTL path below
 
@@ -1606,14 +1602,12 @@ async def _preprocess_phase_b(
                 is_additive_evolution = validation_result.get('is_additive_evolution', False)
 
                 # Guard: reject if column overlap is too low
-                raw_pct = validation_result.get('match_percentage', 0.0)
-                norm_pct = validation_result.get('normalized_match_percentage', raw_pct)
-                match_pct = max(raw_pct, norm_pct)
+                # match_percentage now includes LLM-reconciled column pairs
+                match_pct = validation_result.get('match_percentage', 0.0)
                 if match_pct < settings.schema_match_min_percentage:
                     logger.warning(
                         f"[Job {job_id}] Column fallback schema overlap too low "
-                        f"(raw={raw_pct:.1f}%, normalized={norm_pct:.1f}% < "
-                        f"{settings.schema_match_min_percentage}%) "
+                        f"({match_pct:.1f}% < {settings.schema_match_min_percentage}%) "
                         f"for '{matched_table_name}' — treating as OTL"
                     )
                     similar_tables = []

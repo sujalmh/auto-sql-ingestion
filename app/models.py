@@ -58,6 +58,7 @@ class SchemaValidationResult(BaseModel):
     matching_columns: List[str] = Field(..., description="Columns present in both")
     missing_columns: List[str] = Field(..., description="Columns in table but not in file")
     extra_columns: List[str] = Field(..., description="Columns in file but not in table")
+    reconciled_columns: List[Dict[str, str]] = Field(default_factory=list, description="LLM-reconciled column pairs [{existing, new}]")
     discrepancy_report: str = Field(..., description="Human-readable report")
     type_mismatches: Optional[Dict[str, Any]] = Field(None, description="Type drift details per column")
 
