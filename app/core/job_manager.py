@@ -395,11 +395,14 @@ class JobManager:
         Returns:
             (peer_job_id, peer_table_name, overlap_score)  or  None
         """
-        # Statuses that indicate a job has been preprocessed and is waiting
+        # Statuses that indicate a job has been preprocessed and is waiting.
+        # PREPROCESSING jobs are also eligible when they have a non-null
+        # processed_df (Phase A complete, Phase B pending).
         eligible_statuses = {
             JobStatus.AWAITING_APPROVAL,
             JobStatus.SCHEMA_MISMATCH,
             JobStatus.DUPLICATE_DATA_DETECTED,
+            JobStatus.PREPROCESSING,
         }
 
         norm_new = {normalize_column_for_similarity(c) for c in new_columns}

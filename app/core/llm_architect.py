@@ -59,7 +59,7 @@ File Information:
 - First 10 rows sample: {json.dumps(file_info['first_10_rows'], indent=2, default=str)}
 
 Tasks:
-1. date_columns: List ONLY columns whose HEADER VALUE itself is a specific period/year to melt from wide to long format (e.g. "2011-12", "2012-13", "Q1 2024", "Jan-2023", "Apr-2023"). These are columns where each header IS a time point and the cell values are the metric.
+1. date_columns: List ONLY columns whose HEADER VALUE itself is a specific period/year to melt from wide to long format (e.g. "2011-12", "2012-13", "Q1 2024", "Jan-2023", "Apr-2023", "April 01, 2018 - May 31, 2018"). These are columns where each header IS a time point (including cumulative date ranges) and the cell values are the metric.
    CRITICAL: Do NOT include columns whose header is a GENERIC LABEL like "Month", "Year", "Date", "Period", "Quarter" — even if the row values underneath them are months or years. Those are regular data columns, not date headers to melt. Only melt when the column header text IS a specific date/time period.
    Leave date_columns EMPTY if columns are metric names that merely mention a date in the description (e.g. "Funds Mobilised for the month of Dec 2025 (INR in crore)" or "No. of Schemes as on Dec 31, 2025")—those are single-point metrics, not time-series columns to melt.
 2. Detect if headers span multiple levels and need merging. This includes:
@@ -413,6 +413,9 @@ NOT COLUMN HEADERS (do NOT count these):
 RULES:
 - If row 0 has labels in many columns (true column titles) and row 1 has only 1–2 cells filled (e.g. section title) → return 1.
 - Only return 2 or 3 when you see TWO or THREE consecutive rows that each have labels spanning MANY columns (e.g. merged Excel headers where row 0 = "Category", row 1 = "Year | State | Value" with values in many columns).
+- Ignore blank separator rows entirely.
+- Ignore column-numbering rows like `1 | 2 | 3 | 4`.
+- Ignore sparse section rows like `A | Open Ended Schemes` or `II | Public Sector Banks` even if they appear immediately after the real column titles.
 
 Respond with ONLY a single number: 1, 2, or 3"""
             

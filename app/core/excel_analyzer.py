@@ -37,6 +37,8 @@ class SubTable:
     label: Optional[str] = None       # e.g. "Constant Prices", "Current Prices"
     base_year: Optional[str] = None   # e.g. "2011-12", "2004-05"
     unit_hint: Optional[str] = None
+    horizontal_split: bool = False    # True when split from a horizontally-tiled table
+    label_column: Optional[str] = None  # column name for the label (e.g. "exchange")
 
 
 @dataclass
@@ -118,10 +120,46 @@ _UNIT_PATTERNS = re.compile(
 )
 
 _COL_NUMBER_RE = re.compile(r"^\s*\d+\s*$")
+_SECTION_MARKER_RE = re.compile(r"^\s*(?:[A-Z]|[IVXLCDM]+)[\.)]?\s*$", re.IGNORECASE)
 
 
 class ExcelAnalyzer:
     """Analyze Excel (.xlsx) file structure before pandas loading."""
+
+    def _has_meaningful_value(self, value: object) -> bool:
+        if value is None:
+            return False
+        text = str(value).strip()
+        return text != "" and text.lower() != "nan"
+
+    def _meaningful_cells(self, row: List[object]) -> List[Tuple[int, object]]:
+        return [(c, v) for c, v in enumerate(row[1:], 1) if self._has_meaningful_value(v)]
+
+    def _is_sparse_section_row(self, non_null: List[Tuple[int, object]]) -> bool:
+        """
+        Detect structural rows like "A | Open ended schemes" that should not
+        be classified as real column headers.
+        """
+        if len(non_null) == 0 or len(non_null) > 3:
+            return False
+
+        cols = [c for c, _ in non_null]
+        if max(cols) > 3:
+            return False
+
+        values = [str(v).strip() for _, v in non_null]
+        if not all(values):
+            return False
+
+        if len(values) == 1:
+            return len(values[0]) < 80 and not _COL_NUMBER_RE.match(values[0])
+
+        first_val = values[0]
+        remaining_text = " ".join(values[1:]).strip()
+        if _SECTION_MARKER_RE.match(first_val):
+            return True
+
+        return len(first_val) <= 6 and not _COL_NUMBER_RE.match(first_val) and len(remaining_text) > 0
 
     def analyze(self, file_path: str, sheet_name: Optional[str] = None) -> ExcelStructure:
         """
@@ -308,7 +346,7 @@ class ExcelAnalyzer:
 
             while cursor <= max_row:
                 row = grid[cursor]
-                non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+                non_null = self._meaningful_cells(row)
                 if len(non_null) == 0:
                     cursor += 1
                     continue
@@ -378,7 +416,7 @@ class ExcelAnalyzer:
             data_end = data_start
             for r in range(data_start, max_row + 1):
                 row = grid[r]
-                non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+                non_null = self._meaningful_cells(row)
                 if len(non_null) == 0:
                     # Empty row → end of this sub-table's data
                     data_end = r - 1
@@ -418,12 +456,15 @@ class ExcelAnalyzer:
                 base_year=base_year,
                 unit_hint=unit,
             )
-            sub_tables.append(sub)
-            logger.info(
-                f"ExcelAnalyzer: sub-table in [{sheet_name}] "
-                f"rows {data_start}-{data_end}, "
-                f"base_year={base_year}, label={label}"
-            )
+            # Check for horizontally-tiled tables (side-by-side with empty separator columns)
+            split_subs = self._split_horizontal_sub_tables(grid, sub)
+            sub_tables.extend(split_subs)
+            for s in split_subs:
+                logger.info(
+                    f"ExcelAnalyzer: sub-table in [{sheet_name}] "
+                    f"rows {s.data_start_row}-{s.data_end_row}, cols {s.min_data_col}-{s.max_data_col}, "
+                    f"base_year={s.base_year}, label={s.label}, hsplit={s.horizontal_split}"
+                )
             cursor = data_end + 1
 
         return sub_tables
@@ -431,7 +472,126 @@ class ExcelAnalyzer:
     def _is_empty_row(self, grid: List[List], r: int) -> bool:
         if r < 1 or r >= len(grid):
             return True
-        return all(v is None for v in grid[r][1:])
+        return all(not self._has_meaningful_value(v) for v in grid[r][1:])
+
+    # ────────── Horizontal sub-table splitting ──────────
+
+    def _split_horizontal_sub_tables(
+        self, grid: List[List], sub: SubTable,
+    ) -> List[SubTable]:
+        """
+        Check if a sub-table contains multiple tables placed side-by-side,
+        separated by consistently empty columns.  If so, split into one
+        SubTable per horizontal block.  Otherwise return [sub] unchanged.
+        """
+        # 1. Identify columns that are empty in BOTH headers AND data rows
+        sample_data_rows = list(range(
+            sub.data_start_row,
+            min(sub.data_end_row + 1, sub.data_start_row + 10),
+        ))
+        check_rows = list(sub.header_rows) + sample_data_rows
+
+        empty_cols: set = set()
+        for c in range(sub.min_data_col, sub.max_data_col + 1):
+            is_empty = True
+            for r in check_rows:
+                if r < len(grid) and c < len(grid[r]):
+                    if self._has_meaningful_value(grid[r][c]):
+                        is_empty = False
+                        break
+            if is_empty:
+                empty_cols.add(c)
+
+        if not empty_cols:
+            return [sub]
+
+        # 2. Find contiguous non-empty column blocks
+        blocks: List[Tuple[int, int]] = []
+        block_start: Optional[int] = None
+        for c in range(sub.min_data_col, sub.max_data_col + 1):
+            if c not in empty_cols:
+                if block_start is None:
+                    block_start = c
+            else:
+                if block_start is not None:
+                    blocks.append((block_start, c - 1))
+                    block_start = None
+        if block_start is not None:
+            blocks.append((block_start, sub.max_data_col))
+
+        if len(blocks) <= 1:
+            return [sub]
+
+        # 3. Reject if block widths are very uneven (not a tiled layout)
+        widths = [end - start + 1 for start, end in blocks]
+        if max(widths) > 2 * min(widths):
+            return [sub]
+
+        # 4. Build a SubTable for each horizontal block
+        result: List[SubTable] = []
+        for block_start, block_end in blocks:
+            # Extract the group label from the first header row
+            # (e.g. "BSE", "NSE") — skip generic words like "Period"
+            label: Optional[str] = None
+            if sub.header_rows:
+                first_hdr = sub.header_rows[0]
+                for c in range(block_start, block_end + 1):
+                    if c < len(grid[first_hdr]):
+                        v = grid[first_hdr][c]
+                        if (self._has_meaningful_value(v)
+                                and isinstance(v, str)
+                                and str(v).strip().lower() != "period"):
+                            label = re.sub(r'\s+', ' ', str(v).strip())
+                            break
+
+            # Build single-level header: prefer bottom header row,
+            # fall back to upper rows (but skip the group label text)
+            hdr: List[Optional[str]] = []
+            for c in range(block_start, block_end + 1):
+                val: Optional[str] = None
+                for hr in reversed(sub.header_rows):
+                    if hr < len(grid) and c < len(grid[hr]):
+                        v = grid[hr][c]
+                        if self._has_meaningful_value(v):
+                            text = re.sub(r'\s+', ' ', str(v).strip())
+                            # Skip the label itself (goes to the label column)
+                            if label and text.lower() == label.lower():
+                                continue
+                            val = text
+                            break
+                hdr.append(val)
+
+            new_sub = SubTable(
+                sheet_name=sub.sheet_name,
+                header_rows=sub.header_rows,
+                col_number_row=sub.col_number_row,
+                data_start_row=sub.data_start_row,
+                data_end_row=sub.data_end_row,
+                min_data_col=block_start,
+                max_data_col=block_end,
+                num_header_rows=len(sub.header_rows),
+                merged_header_values=[hdr],
+                label=label,
+                base_year=sub.base_year,
+                unit_hint=sub.unit_hint,
+                horizontal_split=True,
+                label_column="source",
+            )
+            result.append(new_sub)
+
+        # Use the first block's header names as canonical for all blocks
+        # to ensure pd.concat alignment (avoids minor formatting diffs)
+        if len(result) > 1:
+            canonical_hdr = result[0].merged_header_values
+            for s in result[1:]:
+                s.merged_header_values = canonical_hdr
+
+        logger.info(
+            f"ExcelAnalyzer: horizontal split [{sub.sheet_name}] → "
+            f"{len(result)} blocks: "
+            f"{[(s.min_data_col, s.max_data_col, s.label) for s in result]}"
+        )
+        return result
 
     def _normalise_header(self, merged_vals: Optional[List[List[Optional[str]]]]) -> Tuple[str, ...]:
         """Collapse multi-level headers into a normalised tuple for comparison."""
@@ -536,7 +696,7 @@ class ExcelAnalyzer:
 
         for r in range(1, min(max_row + 1, 12)):  # scan first 11 rows
             row = grid[r]
-            non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+            non_null = self._meaningful_cells(row)
 
             if len(non_null) == 0:
                 # empty row — could be separator between title and headers
@@ -566,6 +726,11 @@ class ExcelAnalyzer:
                         title_hint = val_str
                     continue
 
+            if self._is_sparse_section_row(non_null):
+                if title_hint is None:
+                    title_hint = " ".join(str(v).strip() for _, v in non_null)
+                continue
+
             # Multiple non-null values in different columns → likely a header or data row
             # Check if at least 3 columns have values (characteristic of headers)
             if len(non_null) >= 3:
@@ -590,27 +755,42 @@ class ExcelAnalyzer:
         """
         header_rows: List[int] = []
         col_number_row: Optional[int] = None
+        consecutive_blank_rows = 0
 
         for r in range(first_content_row, min(max_row + 1, first_content_row + 10)):
             row = grid[r]
-            non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+            non_null = self._meaningful_cells(row)
             if len(non_null) == 0:
+                consecutive_blank_rows += 1
+                if header_rows and consecutive_blank_rows >= 1:
+                    break
                 continue
+            consecutive_blank_rows = 0
 
             # Check if this is a column-numbering row (1, 2, 3, ...)
             if self._is_column_number_row(non_null):
                 col_number_row = r
                 continue
 
+            if self._is_sparse_section_row(non_null):
+                if header_rows:
+                    break
+                continue
+
             # Check if this looks like a header row
             str_count = sum(1 for _, v in non_null if isinstance(v, str) and not _COL_NUMBER_RE.match(str(v).strip()))
             num_count = sum(1 for _, v in non_null if isinstance(v, (int, float)) and not isinstance(v, bool))
+            filled_cols = len(non_null)
 
             # A header row has predominantly string values
-            if str_count >= 2 and str_count >= num_count:
+            if filled_cols >= 3 and str_count >= max(2, min(3, filled_cols)) and str_count >= num_count:
                 header_rows.append(r)
+                if len(header_rows) >= 3:
+                    break
             elif num_count > str_count and len(header_rows) > 0:
                 # We've hit data rows; stop
+                break
+            elif header_rows:
                 break
 
         if not header_rows:
@@ -638,9 +818,17 @@ class ExcelAnalyzer:
         if not numbers:
             return False
 
-        # Check if they're roughly sequential starting from 1
-        # Allow small gaps (some columns might be empty)
-        return numbers[0] == 1 and numbers[-1] >= len(numbers) * 0.5
+        if len(set(numbers)) != len(numbers):
+            return False
+        if numbers[0] != 1:
+            return False
+
+        deltas = [curr - prev for prev, curr in zip(numbers, numbers[1:])]
+        if any(delta <= 0 for delta in deltas):
+            return False
+
+        near_sequential = sum(1 for delta in deltas if delta in (1, 2))
+        return near_sequential >= max(len(deltas) - 1, 1)
 
     def _detect_col_range(
         self, grid: List[List], header_rows: List[int], max_col: int,
@@ -670,7 +858,7 @@ class ExcelAnalyzer:
 
         for r in range(max_row, max(data_start - 1, 0), -1):
             row = grid[r]
-            non_null = [(c, v) for c, v in enumerate(row[1:], 1) if v is not None]
+            non_null = self._meaningful_cells(row)
 
             if len(non_null) == 0:
                 # Empty row — could be separator between data and footer
@@ -698,7 +886,7 @@ class ExcelAnalyzer:
 
         # Adjust: if last_data_row still points at an empty row, move up
         while last_data_row > data_start and all(
-            v is None for v in grid[last_data_row][1:]
+            not self._has_meaningful_value(v) for v in grid[last_data_row][1:]
         ):
             last_data_row -= 1
 
@@ -721,12 +909,23 @@ class ExcelAnalyzer:
             return []
 
         result = []
+        previous_row: Optional[List[Optional[str]]] = None
         for r in header_rows:
             row_vals = []
-            for c in range(min_col, max_col + 1):
+            has_meaningful_header = False
+            for idx, c in enumerate(range(min_col, max_col + 1)):
                 v = grid[r][c] if c < len(grid[r]) else None
-                row_vals.append(str(v).strip() if v is not None else None)
-            result.append(row_vals)
+                cell_text = str(v).strip() if self._has_meaningful_value(v) else None
+                if cell_text and _COL_NUMBER_RE.match(cell_text):
+                    cell_text = None
+                if cell_text is None and previous_row and idx < len(previous_row):
+                    cell_text = previous_row[idx]
+                if cell_text is not None:
+                    has_meaningful_header = True
+                row_vals.append(cell_text)
+            if has_meaningful_header:
+                result.append(row_vals)
+                previous_row = row_vals
         return result
 
 

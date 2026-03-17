@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 import asyncio
 import re
+import urllib.parse
 import pandas as pd
 import shutil
 from datetime import datetime
@@ -57,6 +58,7 @@ PROCESSED_DIR.mkdir(exist_ok=True)
 # This is critical for peer-job matching in batch uploads — file B must
 # wait for file A to finish so it can detect A as a peer match.
 _preprocess_lock = asyncio.Lock()
+_preprocess_semaphore = asyncio.Semaphore(5)
 
 # Mount static files for web UI
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -568,23 +570,30 @@ async def preprocess_file(
     """
     Background task to preprocess the uploaded file.
     
-    Serialized via _preprocess_lock so that batch uploads are processed
-    one at a time, enabling peer-job detection within the same batch.
+    Phase A (concurrent, semaphore-limited to 5):
+      Steps 1-8: file loading, LLM analysis, preprocessing, type inference,
+      metadata generation, Milvus signature + search.
     
-    Args:
-        job_id: Job identifier
-        file_path: Path to uploaded file
-        file_description: Optional user-provided description to help with table naming
+    Phase B (sequential, under lock):
+      Steps 9-10: IL resolution (Milvus match validation, column fallback,
+      peer-job matching, OTL determination), store results.
     """
-    async with _preprocess_lock:
-        await _preprocess_file_inner(
-            job_id,
-            file_path,
-            file_description,
-            table_name_override,
-            skip_llm_table_name,
-            sql_mode,
-        )
+    try:
+        # Phase A: concurrent preprocessing (limited to 5 parallel)
+        async with _preprocess_semaphore:
+            phase_a_ctx = await _preprocess_phase_a(
+                job_id, file_path, file_description,
+                table_name_override, skip_llm_table_name, sql_mode,
+            )
+        if phase_a_ctx is None:
+            return  # error already set inside phase_a
+
+        # Phase B: sequential IL resolution
+        async with _preprocess_lock:
+            await _preprocess_phase_b(job_id, file_path, file_description, phase_a_ctx)
+    except Exception as e:
+        logger.error(f"[Job {job_id}] Preprocessing failed: {str(e)}", exc_info=True)
+        job_manager.set_error(job_id, f"Preprocessing failed: {str(e)}")
 
 
 def _generate_non_colliding_table_name_via_llm(
@@ -624,6 +633,39 @@ def _generate_non_colliding_table_name_via_llm(
 
 def _load_sub_table_df(file_path: str, sub, job_id: str) -> pd.DataFrame:
     """Load a single SubTable from an Excel workbook as a DataFrame."""
+
+    # ── Horizontal sub-tables: skip all header rows, load raw data + usecols,
+    #    then apply pre-computed column names (pandas forbids usecols + multi-header).
+    if getattr(sub, 'horizontal_split', False):
+        all_skiprows = list(range(0, sub.data_start_row - 1))
+        if sub.col_number_row is not None:
+            all_skiprows.append(sub.col_number_row - 1)
+        usecols = list(range(sub.min_data_col - 1, sub.max_data_col))
+        nrows = sub.data_end_row - sub.data_start_row + 1
+
+        df = pd.read_excel(
+            file_path,
+            sheet_name=sub.sheet_name,
+            skiprows=sorted(set(all_skiprows)),
+            header=None,
+            nrows=nrows,
+            usecols=usecols,
+        )
+        # Apply pre-computed column names
+        if sub.merged_header_values and sub.merged_header_values[0]:
+            names = sub.merged_header_values[0]
+            if len(names) == len(df.columns):
+                df.columns = [n or f"column_{i}" for i, n in enumerate(names)]
+
+        logger.info(
+            f"[Job {job_id}] Loaded horizontal sub-table [{sub.sheet_name}] "
+            f"rows {sub.data_start_row}-{sub.data_end_row}, "
+            f"cols {sub.min_data_col}-{sub.max_data_col}: "
+            f"{df.shape[0]}x{df.shape[1]}, label={sub.label}"
+        )
+        return df
+
+    # ── Normal (full-width) sub-table loading ──
     # Skip all rows before the first header row (0-indexed)
     skiprows = list(range(0, sub.header_rows[0] - 1))
     # Also skip the column-numbering row if present
@@ -672,14 +714,14 @@ def _load_sub_table_df(file_path: str, sub, job_id: str) -> pd.DataFrame:
     return df
 
 
-async def _preprocess_file_inner(
+async def _preprocess_phase_a(
     job_id: str,
     file_path: str,
     file_description: Optional[str] = None,
     table_name_override: Optional[str] = None,
     skip_llm_table_name: bool = False,
     sql_mode: Optional[str] = None,
-): 
+) -> Optional[dict]:
     logger.info(f"[Job {job_id}] Starting preprocessing pipeline")
     normalized_sql_mode = (sql_mode or "").strip().lower()
     if normalized_sql_mode in ("otl", "inc") and table_name_override:
@@ -784,8 +826,9 @@ async def _preprocess_file_inner(
                     if sub.base_year:
                         sub_df.insert(0, "base_year", sub.base_year)
                     if sub.label:
+                        col_name = getattr(sub, 'label_column', None) or "price_type"
                         pos = 1 if "base_year" in sub_df.columns else 0
-                        sub_df.insert(pos, "price_type", sub.label)
+                        sub_df.insert(pos, col_name, sub.label)
                     # Fallback: use sheet name as distinguishing column
                     if not sub.base_year and not sub.label:
                         sub_df.insert(0, "sheet_label", sub.sheet_name)
@@ -916,6 +959,26 @@ async def _preprocess_file_inner(
             classification = category_classifier.classify(df, analysis)
             data_category = classification.get("category", 1)
         
+        # Step 2c: Normalize filename for table naming
+        # URL-decode, strip download suffixes (-M_p, -Y_p, _p), detect frequency
+        raw_stem = Path(file_path).stem
+        norm_stem = urllib.parse.unquote(raw_stem)
+        # Detect monthly/yearly frequency from suffix before stripping
+        _freq_suffix = ""
+        if re.search(r'[-_]M_p$', norm_stem, re.IGNORECASE):
+            _freq_suffix = "_monthly"
+        elif re.search(r'[-_]Y_p$', norm_stem, re.IGNORECASE):
+            _freq_suffix = "_yearly"
+        # Strip download suffixes
+        norm_stem = re.sub(r'[-_][MY]_p$', '', norm_stem, flags=re.IGNORECASE)
+        norm_stem = re.sub(r'_p$', '', norm_stem, flags=re.IGNORECASE)
+        # Strip leading "Table N " prefix
+        norm_stem = re.sub(r'^Table\s*\d+\s*[-_]?\s*', '', norm_stem, flags=re.IGNORECASE)
+        # Replace URL-encoding residuals and special chars
+        norm_stem = re.sub(r'[%+]', ' ', norm_stem).strip()
+        norm_stem = norm_stem + _freq_suffix
+        logger.info(f"[Job {job_id}] Normalized filename: '{raw_stem}' → '{norm_stem}'")
+        
         # Step 3: Determine table name
         if skip_llm_table_name and table_name_override:
             logger.info(f"[Job {job_id}] Skipping LLM table-name generation due to manual override")
@@ -923,7 +986,7 @@ async def _preprocess_file_inner(
             logger.info(f"[Job {job_id}] Using manual table name: {table_name}")
         else:
             logger.info(f"[Job {job_id}] Generating table name with LLM")
-            table_name = llm_architect.generate_table_name(df, analysis, file_description, filename=Path(file_path).stem)
+            table_name = llm_architect.generate_table_name(df, analysis, file_description, filename=norm_stem)
             table_name_generated_by_llm = True
 
             # Step 3b: Refine table name if too long
@@ -950,11 +1013,14 @@ async def _preprocess_file_inner(
         column_mapping = clean_result.get("mapping", {})
         drop_columns = clean_result.get("drop_columns", [])
 
+        # Protect critical columns from being dropped or renamed by the LLM
+        protected_columns = {'month_numeric', 'month_name', 'month', 'year', 'period',
+                             'fiscal_year', 'quarter',
+                             'from_month', 'from_year', 'to_month', 'to_year',
+                             'state', 'value', 'total', 'refresh_date', 'data_period'}
+
         # Drop redundant/metadata columns first (with safeguard for critical columns)
         if drop_columns:
-            # Protect critical columns from being dropped by the LLM
-            protected_columns = {'month_numeric', 'month_name', 'month', 'year', 'period',
-                                 'state', 'value', 'total', 'refresh_date', 'data_period'}
             protected_dropped = [c for c in drop_columns if c.lower() in protected_columns]
             if protected_dropped:
                 logger.warning(f"[Job {job_id}] LLM tried to drop protected columns: {protected_dropped} — keeping them")
@@ -966,8 +1032,10 @@ async def _preprocess_file_inner(
 
         # Apply cleaned column names (mapping only includes kept columns)
         if column_mapping:
-            # Only rename columns that still exist
-            rename_map = {k: v for k, v in column_mapping.items() if k in processed_df.columns}
+            # Only rename columns that still exist; protect structural time columns
+            # from being renamed to avoid losing from/to semantics.
+            rename_map = {k: v for k, v in column_mapping.items()
+                          if k in processed_df.columns and k.lower() not in protected_columns}
             processed_df.rename(columns=rename_map, inplace=True)
             logger.info(f"[Job {job_id}] Columns after LLM cleaning: {processed_df.columns.tolist()}")
 
@@ -1050,6 +1118,67 @@ async def _preprocess_file_inner(
         except Exception as e:
             logger.error(f"[Job {job_id}] Milvus search failed: {str(e)}, proceeding with OTL")
         
+        # ── Phase A complete: store intermediate results, return context for Phase B ──
+        job_manager.set_preprocessing_results(
+            job_id=job_id,
+            processed_df=processed_df,
+            table_name=table_name,
+            column_types=column_types,
+            summary=summary,
+            llm_metadata=llm_metadata,
+        )
+        logger.info(f"[Job {job_id}] Phase A complete — processed_df stored.")
+
+        return {
+            "df": df,
+            "processed_df": processed_df,
+            "table_name": table_name,
+            "table_name_generated_by_llm": table_name_generated_by_llm,
+            "column_types": column_types,
+            "analysis": analysis,
+            "summary": summary,
+            "llm_metadata": llm_metadata,
+            "signature": signature,
+            "embedding": embedding,
+            "similar_tables": similar_tables,
+            "milvus_connected": milvus_connected,
+            "normalized_sql_mode": normalized_sql_mode,
+        }
+
+    except Exception as e:
+        logger.error(f"[Job {job_id}] Phase A failed: {str(e)}", exc_info=True)
+        job_manager.set_error(job_id, f"Preprocessing failed: {str(e)}")
+        return None
+
+
+async def _preprocess_phase_b(
+    job_id: str,
+    file_path: str,
+    file_description: Optional[str],
+    ctx: dict,
+):
+    """Phase B: sequential IL resolution under lock."""
+    df = ctx["df"]
+    processed_df = ctx["processed_df"]
+    table_name = ctx["table_name"]
+    table_name_generated_by_llm = ctx["table_name_generated_by_llm"]
+    column_types = ctx["column_types"]
+    analysis = ctx["analysis"]
+    llm_metadata = ctx["llm_metadata"]
+    signature = ctx["signature"]
+    embedding = ctx["embedding"]
+    similar_tables = list(ctx["similar_tables"])  # copy to mutate locally
+    milvus_connected = ctx["milvus_connected"]
+    normalized_sql_mode = ctx["normalized_sql_mode"]
+    summary = ctx["summary"]
+
+    table_name_override = None
+    if normalized_sql_mode in ("otl", "inc"):
+        job = job_manager.get_job(job_id)
+        if job:
+            table_name_override = getattr(job, "proposed_table_name", None) or table_name
+
+    try:
         # Step 9: Decide between OTL and IL
         matched_table_name = ""
         validation_result = {}
@@ -1057,9 +1186,21 @@ async def _preprocess_file_inner(
         is_compatible = False
         is_additive_evolution = False
         manual_inc_target = normalized_sql_mode == "inc" and bool(table_name_override)
+        manual_otl_target = normalized_sql_mode == "otl" and bool(table_name_override)
 
         manual_inc_handled = False
 
+        if manual_otl_target:
+            # Explicit OTL requested — bypass all similarity matching and force
+            # a fresh One-Time Load into the specified table name.
+            logger.info(
+                f"[Job {job_id}] Manual OTL mode selected. "
+                f"Bypassing similarity matching and forcing new-table OTL for '{table_name_override}'."
+            )
+            similar_tables = []  # discard any Milvus / fallback matches
+            # Also mark as handled so the column-based and peer-job fallback
+            # paths in the else-branch below are skipped entirely.
+            manual_inc_handled = True
         if manual_inc_target:
             target_table = str(table_name_override).strip().lower().replace(" ", "_")
             logger.info(
@@ -1559,7 +1700,7 @@ async def _preprocess_file_inner(
                 f"for non-incremental flow. Renamed to '{table_name}'."
             )
 
-        # Step 10: Store preprocessing results
+        # Step 10: Update table name if changed by collision safeguard, set final status
         job_manager.set_preprocessing_results(
             job_id=job_id,
             processed_df=processed_df,
@@ -1580,10 +1721,10 @@ async def _preprocess_file_inner(
         if milvus_connected:
             milvus_manager.disconnect()
 
-        logger.info(f"[Job {job_id}] Preprocessing pipeline complete.")
+        logger.info(f"[Job {job_id}] Phase B complete. Pipeline finished.")
         
     except Exception as e:
-        logger.error(f"[Job {job_id}] Preprocessing failed: {str(e)}", exc_info=True)
+        logger.error(f"[Job {job_id}] Phase B failed: {str(e)}", exc_info=True)
         job_manager.set_error(job_id, f"Preprocessing failed: {str(e)}")
 
 

@@ -375,25 +375,16 @@ async function approveJob() {
 
         const response = await fetch(`/approve/${currentJobId}`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: formData
         });
-
         const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Approval failed');
 
-        if (!response.ok) {
-            throw new Error(data.detail || 'Approval failed');
-        }
-
-        // Show processing again and resume polling
         previewSection.style.display = 'none';
         processingSection.style.display = 'block';
         startStatusPolling();
-
     } catch (error) {
-        // Reset button state on error
         document.getElementById('approve-btn').disabled = false;
         document.getElementById('approve-btn').textContent = '✓ Approve & Insert';
         showError(error.message);
@@ -417,7 +408,6 @@ async function approveILJob() {
         document.getElementById('il-approve-btn').textContent = 'Approving...';
 
         const formData = new URLSearchParams();
-        // For IL, table name comes from matched table (not user input)
         formData.append('source', source);
         formData.append('source_url', sourceUrl);
         formData.append('released_on', releasedOn + 'T00:00:00');
@@ -428,25 +418,16 @@ async function approveILJob() {
 
         const response = await fetch(`/approve/${currentJobId}`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-            },
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: formData
         });
-
         const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Approval failed');
 
-        if (!response.ok) {
-            throw new Error(data.detail || 'Approval failed');
-        }
-
-        // Show processing again and resume polling
         ilPreviewSection.style.display = 'none';
         processingSection.style.display = 'block';
         startStatusPolling();
-
     } catch (error) {
-        // Reset button state on error
         document.getElementById('il-approve-btn').disabled = false;
         document.getElementById('il-approve-btn').textContent = '✓ Approve & Append Data';
         showError(error.message);
@@ -473,7 +454,6 @@ function showSuccess(result, isIL = false) {
     processingSection.style.display = 'none';
     successSection.style.display = 'block';
 
-    // Show load type
     const loadTypeEl = document.getElementById('success-load-type');
     if (isIL) {
         loadTypeEl.innerHTML = '<span class="badge badge-il">🔄 Incremental Load</span>';
@@ -499,7 +479,6 @@ function showError(message) {
     errorSection.style.display = 'block';
 
     document.getElementById('error-message').textContent = message;
-
     stopStatusPolling();
 }
 
@@ -524,11 +503,23 @@ function resetUI() {
     uploadBtn.disabled = true;
     uploadBtn.textContent = 'Upload & Process';
 
+    // Reset approve button states
+    document.getElementById('approve-btn').disabled = false;
+    document.getElementById('approve-btn').textContent = '✓ Approve & Insert';
+    document.getElementById('il-approve-btn').disabled = false;
+    document.getElementById('il-approve-btn').textContent = '✓ Approve & Append Data';
+
     // Reset progress steps
     document.querySelectorAll('.progress-step').forEach(step => {
         step.classList.remove('active', 'completed');
         step.querySelector('.step-status').textContent = 'Waiting...';
     });
+
+    // Reset IL preview sections
+    document.getElementById('matching-columns-section').style.display = 'none';
+    document.getElementById('missing-columns-section').style.display = 'none';
+    document.getElementById('extra-columns-section').style.display = 'none';
+    document.getElementById('duplicate-warning').style.display = 'none';
 
     stopStatusPolling();
     localStorage.removeItem('currentJobId');
@@ -539,7 +530,6 @@ function resetUI() {
 async function checkExistingJob() {
     const savedJobId = localStorage.getItem('currentJobId');
     if (savedJobId) {
-        // Verify the job still exists before resuming
         try {
             const response = await fetch(`/status/${savedJobId}`);
             if (response.ok) {
@@ -547,15 +537,10 @@ async function checkExistingJob() {
                 showProcessing();
                 startStatusPolling();
             } else {
-                // Job doesn't exist anymore, clear it silently
-                console.log('Saved job no longer exists, clearing');
                 localStorage.removeItem('currentJobId');
-                // Don't show error, just let user start fresh
             }
         } catch (error) {
-            console.error('Error checking existing job:', error);
             localStorage.removeItem('currentJobId');
-            // Don't show error, just let user start fresh
         }
     }
 }

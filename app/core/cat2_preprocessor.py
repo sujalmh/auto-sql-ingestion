@@ -73,6 +73,11 @@ class Cat2Preprocessor:
             df = self.flatten_wide_to_long(df, analysis)
             summary_steps.append("Flattened wide-to-long")
 
+        # 8.5 Split period column into structured year/month/fiscal_year
+        if 'period' in df.columns:
+            df = preprocessor._split_period_to_columns(df)
+            summary_steps.append("Split period into structured columns")
+
         # 9. Add standard columns
         df = self.add_standard_columns(df, analysis)
         summary_steps.append("Added refresh_date")

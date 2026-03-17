@@ -192,7 +192,23 @@ class DataPreprocessor:
                     actual_date_columns.extend(matching_cols)
                 else:
                     logger.warning(f"Date column '{date_col}' not found in DataFrame")
-        
+
+        # Regex-based fallback: catch any remaining columns that look like date
+        # periods but weren't matched due to LLM whitespace / punctuation drift.
+        matched_set = set(actual_date_columns)
+        _date_regexes = [
+            self._DATE_RANGE_RE, self._FY_RE, self._MON_YEAR_RE,
+            self._QUARTER_YEAR_RE, self._PLAIN_YEAR_RE,
+        ]
+        for col in df.columns:
+            if col in matched_set:
+                continue
+            col_str = str(col).strip()
+            if any(rx.match(col_str) for rx in _date_regexes):
+                actual_date_columns.append(col)
+                matched_set.add(col)
+                logger.info(f"Regex fallback matched date column: '{col}'")
+
         if not actual_date_columns:
             logger.warning("No matching date columns found, skipping transformation")
             return df
@@ -216,39 +232,260 @@ class DataPreprocessor:
             value_name='value'
         )
         
-        # Try to parse the period column as dates
-        df_melted['period'] = self._parse_period_column(df_melted['period'])
+        # Split the 'period' column into structured year/month/fiscal_year columns
+        df_melted = self._split_period_to_columns(df_melted)
         
         logger.info(f"Transformed shape: {df.shape} → {df_melted.shape}")
         return df_melted
     
-    def _parse_period_column(self, period_series: pd.Series) -> pd.Series:
+    # ── Regex patterns for period splitting ──
+    _FY_RE = re.compile(
+        r'^\s*(?:FY\s*)?'
+        r'(\d{4})'
+        r'\s*[–\-/]\s*'
+        r'(\d{2,4})'
+        r'\s*$',
+        re.IGNORECASE,
+    )
+    _MON_YEAR_RE = re.compile(
+        r'^\s*'
+        r'(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
+        r'jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+        r'[\s.\-,/]+'
+        r'(\d{4})'
+        r'\s*$',
+        re.IGNORECASE,
+    )
+    _QUARTER_YEAR_RE = re.compile(
+        r'^\s*Q([1-4])'
+        r'[\s\-/]+'
+        r'(\d{4})'
+        r'\s*$',
+        re.IGNORECASE,
+    )
+    _PLAIN_YEAR_RE = re.compile(r'^\s*(\d{4})\s*$')
+    # Date range: "April 01, 2018 - May 31, 2018" → captures both start and end
+    _MONTH_NAMES_ALT = (
+        r'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
+        r'jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?'
+    )
+    _DATE_RANGE_RE = re.compile(
+        r'^\s*'
+        r'(' + _MONTH_NAMES_ALT + r')'   # group 1: start month
+        r'\s+(\d{1,2})'                   # group 2: start day
+        r'\s*,?\s*(\d{4})'                # group 3: start year
+        r'\s*[-–]\s*'                      # dash separator
+        r'(' + _MONTH_NAMES_ALT + r')'   # group 4: end month
+        r'\s+(\d{1,2})'                   # group 5: end day
+        r'\s*,?\s*(\d{4})'                # group 6: end year
+        r'\s*$',
+        re.IGNORECASE,
+    )
+    # Year range: "2018-19", "2018-2019", "2018 - 2020"
+    _YEAR_RANGE_RE = re.compile(
+        r'^\s*(\d{4})\s*[-–/]\s*(\d{2,4})\s*$'
+    )
+
+    def _coalesce_duplicate_named_columns(self, df: pd.DataFrame, column_name: str) -> pd.DataFrame:
         """
-        Parse period column to standardized date format.
-        Handles formats like: 'Jan-2023', 'Q1-2024', '2023', 'Jan 2023', etc.
-        
-        Args:
-            period_series: Series containing period strings
-            
-        Returns:
-            Parsed series (as datetime or original if parsing fails)
+        Collapse duplicate columns with the same cleaned name by taking the
+        first non-empty value across duplicates for each row.
         """
-        try:
-            # Try pandas to_datetime with various formats
-            parsed = pd.to_datetime(period_series, errors='coerce')
-            
-            # If most values parsed successfully, use it
-            if parsed.notna().sum() / len(parsed) > 0.8:
-                logger.info("Successfully parsed period column as datetime")
-                return parsed
-            
-            # Otherwise, keep as string
-            logger.info("Keeping period column as string")
-            return period_series
-            
-        except Exception as e:
-            logger.warning(f"Could not parse period column: {str(e)}")
-            return period_series
+        match_positions = [idx for idx, col in enumerate(df.columns) if str(col) == column_name]
+        if len(match_positions) <= 1:
+            return df
+
+        duplicate_block = df.iloc[:, match_positions].copy()
+        normalized_block = duplicate_block.mask(
+            duplicate_block.apply(lambda col: col.astype(str).str.strip() == '')
+        )
+        merged_series = normalized_block.bfill(axis=1).iloc[:, 0]
+
+        first_position = match_positions[0]
+        keep_positions = [idx for idx in range(df.shape[1]) if idx not in match_positions]
+        df = df.iloc[:, keep_positions].copy()
+        df.insert(first_position, column_name, merged_series)
+
+        logger.info(
+            f"Coalesced {len(match_positions)} duplicate '{column_name}' columns into one"
+        )
+        return df
+
+    def _split_period_to_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Split a 'period' column (created by melt) into structured columns:
+          - 2020-21 / 2021-2022 → fiscal_year (str)
+          - Jan-2024 / January 2024 → year (int) + month (int 1-12)
+          - Q1-2024 → year (int) + quarter (int 1-4)
+          - 2024    → year (int)
+        Falls back to keeping 'period' as-is when pattern is unrecognised.
+        """
+        if 'period' not in df.columns:
+            return df
+
+        df = self._coalesce_duplicate_named_columns(df, 'period')
+
+        samples = df['period'].dropna().astype(str).str.strip()
+        if samples.empty:
+            return df
+
+        # Pick the dominant pattern from a sample of up to 20 unique values
+        unique_vals = samples.drop_duplicates().head(20)
+
+        fy_hits = sum(1 for v in unique_vals if self._FY_RE.match(v))
+        mon_hits = sum(1 for v in unique_vals if self._MON_YEAR_RE.match(v))
+        qtr_hits = sum(1 for v in unique_vals if self._QUARTER_YEAR_RE.match(v))
+        yr_hits = sum(1 for v in unique_vals if self._PLAIN_YEAR_RE.match(v))
+        range_hits = sum(1 for v in unique_vals if self._DATE_RANGE_RE.match(v))
+
+        total = len(unique_vals)
+        threshold = 0.5  # >50% of unique values must match a single pattern
+
+        if fy_hits / total >= threshold:
+            # "2020-21" / "2021-2022" — could be fiscal year OR year range
+            # Fiscal year: end is start+1 (e.g. 2020-21, 2021-2022)
+            # Year range: end is start+2.. (e.g. 2018-2020)
+            def _parse_fy(val):
+                m = self._FY_RE.match(str(val).strip())
+                if not m:
+                    return None, None
+                start = int(m.group(1))
+                end_raw = m.group(2)
+                end = int(end_raw)
+                if len(end_raw) == 2:
+                    end = (start // 100) * 100 + end
+                return start, end
+
+            parsed_fy = [_parse_fy(v) for v in unique_vals]
+            all_fiscal = all(
+                e is not None and e == s + 1
+                for s, e in parsed_fy if s is not None
+            )
+
+            if all_fiscal:
+                # True fiscal year: "2020-21" → fiscal_year="2020-21"
+                def _to_fy(val):
+                    m = self._FY_RE.match(str(val).strip())
+                    if not m:
+                        return val
+                    start = m.group(1)
+                    end = m.group(2)
+                    if len(end) == 4:
+                        end = end[2:]
+                    return f"{start}-{end}"
+                df['fiscal_year'] = df['period'].astype(str).str.strip().apply(_to_fy)
+                df = df.drop(columns=['period'])
+                logger.info(f"Split period → fiscal_year ({fy_hits}/{total} matched)")
+            else:
+                # Year range: "2018-2020" → from_year + to_year
+                def _extract_year_range(val):
+                    m = self._FY_RE.match(str(val).strip())
+                    if not m:
+                        return pd.NA, pd.NA
+                    start = int(m.group(1))
+                    end_raw = m.group(2)
+                    end = int(end_raw)
+                    if len(end_raw) == 2:
+                        end = (start // 100) * 100 + end
+                    return start, end
+                extracted = df['period'].apply(
+                    lambda v: pd.Series(_extract_year_range(v), index=['from_year', 'to_year'])
+                )
+                df['from_year'] = pd.to_numeric(extracted['from_year'], errors='coerce').astype('Int64')
+                df['to_year'] = pd.to_numeric(extracted['to_year'], errors='coerce').astype('Int64')
+                df = df.drop(columns=['period'])
+                logger.info(f"Split period → from_year + to_year ({fy_hits}/{total} matched)")
+
+        elif mon_hits / total >= threshold:
+            # Month-year: "Jan-2024" → year=2024, month=1
+            def _extract_month_year(val):
+                m = self._MON_YEAR_RE.match(str(val).strip())
+                if not m:
+                    return pd.NA, pd.NA
+                month_str = m.group(1).lower()[:3]
+                month_num = self._MONTH_MAP.get(month_str)
+                year_num = int(m.group(2))
+                return year_num, month_num
+            extracted = df['period'].apply(lambda v: pd.Series(_extract_month_year(v), index=['year', 'month']))
+            df['year'] = pd.to_numeric(extracted['year'], errors='coerce').astype('Int64')
+            df['month'] = pd.to_numeric(extracted['month'], errors='coerce').astype('Int64')
+            df = df.drop(columns=['period'])
+            logger.info(f"Split period → year + month ({mon_hits}/{total} matched)")
+
+        elif qtr_hits / total >= threshold:
+            # Quarter: "Q1-2024" → year=2024, quarter=1
+            def _extract_qtr_year(val):
+                m = self._QUARTER_YEAR_RE.match(str(val).strip())
+                if not m:
+                    return pd.NA, pd.NA
+                return int(m.group(2)), int(m.group(1))
+            extracted = df['period'].apply(lambda v: pd.Series(_extract_qtr_year(v), index=['year', 'quarter']))
+            df['year'] = pd.to_numeric(extracted['year'], errors='coerce').astype('Int64')
+            df['quarter'] = pd.to_numeric(extracted['quarter'], errors='coerce').astype('Int64')
+            df = df.drop(columns=['period'])
+            logger.info(f"Split period → year + quarter ({qtr_hits}/{total} matched)")
+
+        elif yr_hits / total >= threshold:
+            # Plain year: "2024" → year=2024
+            df['year'] = pd.to_numeric(
+                df['period'].astype(str).str.strip(), errors='coerce'
+            ).astype('Int64')
+            df = df.drop(columns=['period'])
+            logger.info(f"Split period → year ({yr_hits}/{total} matched)")
+
+        elif range_hits / total >= threshold:
+            # Date range: "April 01, 2018 - May 31, 2018"
+            # Parse both start and end of every range, then decide output columns
+            def _parse_range(val):
+                m = self._DATE_RANGE_RE.match(str(val).strip())
+                if not m:
+                    return pd.NA, pd.NA, pd.NA, pd.NA
+                fm = self._MONTH_MAP.get(m.group(1).lower()[:3])
+                fy = int(m.group(3))
+                tm = self._MONTH_MAP.get(m.group(4).lower()[:3])
+                ty = int(m.group(6))
+                return fm, fy, tm, ty
+
+            parsed = df['period'].apply(
+                lambda v: pd.Series(_parse_range(v),
+                                    index=['_fm', '_fy', '_tm', '_ty'])
+            )
+            fm = pd.to_numeric(parsed['_fm'], errors='coerce')
+            fy = pd.to_numeric(parsed['_fy'], errors='coerce')
+            tm = pd.to_numeric(parsed['_tm'], errors='coerce')
+            ty = pd.to_numeric(parsed['_ty'], errors='coerce')
+
+            valid = fm.notna()
+            same_month = ((fm == tm) & (fy == ty) & valid)
+            # Fiscal year: Apr of year Y → Mar of year Y+1
+            is_fy = ((fm == 4) & (tm == 3) & (ty == fy + 1) & valid)
+
+            if same_month.all():
+                # All ranges are single-month → month + year
+                df['month'] = tm.astype('Int64')
+                df['year'] = ty.astype('Int64')
+                df = df.drop(columns=['period'])
+                logger.info(f"Split period (single-month range) → month + year ({range_hits}/{total} matched)")
+
+            elif is_fy.all():
+                # All ranges are fiscal years (Apr Y → Mar Y+1) → fiscal_year
+                df['fiscal_year'] = fy.astype(int).astype(str) + '-' + (ty % 100).astype(int).apply(lambda v: f"{v:02d}")
+                df = df.drop(columns=['period'])
+                logger.info(f"Split period (fiscal-year range) → fiscal_year ({range_hits}/{total} matched)")
+
+            else:
+                # Mixed / multi-month ranges → from_month, from_year, to_month, to_year
+                df['from_month'] = fm.astype('Int64')
+                df['from_year'] = fy.astype('Int64')
+                df['to_month'] = tm.astype('Int64')
+                df['to_year'] = ty.astype('Int64')
+                df = df.drop(columns=['period'])
+                logger.info(f"Split period (date range) → from_month/year + to_month/year ({range_hits}/{total} matched)")
+
+        else:
+            logger.info("Period column has mixed/unrecognised format — keeping as-is")
+
+        return df
     
     def remove_footer_rows(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -444,6 +681,15 @@ class DataPreprocessor:
         
         # Step 3: Clean data (includes dropping empty columns)
         df = self.clean_data(df)
+
+        # Step 3.5: Split explicit period column for files already in long format
+        # (e.g., CSVs with a native `period` column and no date-column melt step)
+        if 'period' in df.columns:
+            before_cols = set(df.columns)
+            df = self._split_period_to_columns(df)
+            after_cols = set(df.columns)
+            if 'period' not in after_cols and 'period' in before_cols:
+                summary_steps.append("Split period into structured time columns")
         
         # Step 4: Add standard columns (refresh_date, data_period when determinable)
         df["refresh_date"] = date.today().isoformat()
@@ -506,11 +752,12 @@ class DataPreprocessor:
         # (b) 'month' column with numeric values 1-12
         if 'month' in cols_lower:
             month_col = cols_lower['month']
+            df = self._coalesce_duplicate_named_columns(df, month_col)
             try:
                 numeric_vals = pd.to_numeric(df[month_col], errors='coerce')
                 if numeric_vals.dropna().between(1, 12).all() and numeric_vals.notna().sum() > 0:
-                    df = df.rename(columns={month_col: 'month_numeric'})
-                    logger.info(f"Renamed numeric '{month_col}' column to month_numeric")
+                    df['month_numeric'] = numeric_vals.astype('Int64')
+                    logger.info(f"Derived month_numeric from numeric '{month_col}' column")
                     return df
             except Exception:
                 pass
@@ -526,6 +773,7 @@ class DataPreprocessor:
         # (d) 'period' column with parseable dates
         if 'period' in cols_lower:
             period_col = cols_lower['period']
+            df = self._coalesce_duplicate_named_columns(df, period_col)
             try:
                 parsed = pd.to_datetime(df[period_col], errors='coerce')
                 if parsed.notna().sum() / max(len(parsed), 1) > 0.5:
@@ -549,6 +797,7 @@ class DataPreprocessor:
         # (e) 'month_name' column (no 'month' column)
         if 'month_name' in cols_lower and 'month' not in cols_lower:
             mn_col = cols_lower['month_name']
+            df = self._coalesce_duplicate_named_columns(df, mn_col)
             text_vals = df[mn_col].dropna().astype(str).str.strip().str.lower()
             mapped = text_vals.map(self._MONTH_MAP)
             if mapped.notna().sum() > 0:
