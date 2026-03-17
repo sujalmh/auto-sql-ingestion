@@ -1448,10 +1448,16 @@ async def _preprocess_phase_b(
             is_additive_evolution = validation_result.get('is_additive_evolution', False)
 
             # Guard: reject the match if column overlap is too low
-            match_pct = validation_result.get('match_percentage', 0.0)
+            # Use the higher of raw and normalized percentages so that
+            # period-varying columns (e.g. _jan_2024 vs _feb_2025) don't
+            # falsely reduce the overlap score.
+            raw_pct = validation_result.get('match_percentage', 0.0)
+            norm_pct = validation_result.get('normalized_match_percentage', raw_pct)
+            match_pct = max(raw_pct, norm_pct)
             if match_pct < settings.schema_match_min_percentage:
                 logger.warning(
-                    f"[Job {job_id}] Schema overlap too low ({match_pct:.1f}% < "
+                    f"[Job {job_id}] Schema overlap too low (raw={raw_pct:.1f}%, "
+                    f"normalized={norm_pct:.1f}% < "
                     f"{settings.schema_match_min_percentage}%) for match '{matched_table_name}' "
                     f"— treating as new table (OTL)"
                 )
@@ -1600,11 +1606,14 @@ async def _preprocess_phase_b(
                 is_additive_evolution = validation_result.get('is_additive_evolution', False)
 
                 # Guard: reject if column overlap is too low
-                match_pct = validation_result.get('match_percentage', 0.0)
+                raw_pct = validation_result.get('match_percentage', 0.0)
+                norm_pct = validation_result.get('normalized_match_percentage', raw_pct)
+                match_pct = max(raw_pct, norm_pct)
                 if match_pct < settings.schema_match_min_percentage:
                     logger.warning(
                         f"[Job {job_id}] Column fallback schema overlap too low "
-                        f"({match_pct:.1f}% < {settings.schema_match_min_percentage}%) "
+                        f"(raw={raw_pct:.1f}%, normalized={norm_pct:.1f}% < "
+                        f"{settings.schema_match_min_percentage}%) "
                         f"for '{matched_table_name}' — treating as OTL"
                     )
                     similar_tables = []

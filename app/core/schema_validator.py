@@ -266,11 +266,22 @@ class SchemaValidator:
         extra_columns = list(new_set - existing_set)    # In new but not in existing
         matching_columns = list(new_set & existing_set) # In both
         
-        # Calculate match percentage
+        # Calculate match percentage (raw)
         if len(existing_set) > 0:
             match_percentage = (len(matching_columns) / len(existing_set)) * 100
         else:
             match_percentage = 0.0
+
+        # Calculate normalized match percentage (period-aware)
+        # Columns like 'value_jan_2024' and 'value_feb_2025' normalize to the
+        # same base, so they count as a match for IL detection purposes.
+        new_norm = {normalize_column_for_similarity(c): c for c in new_set}
+        existing_norm = {normalize_column_for_similarity(c): c for c in existing_set}
+        norm_matching = set(new_norm.keys()) & set(existing_norm.keys())
+        if len(existing_norm) > 0:
+            normalized_match_percentage = (len(norm_matching) / len(existing_norm)) * 100
+        else:
+            normalized_match_percentage = 0.0
         
         # Determine compatibility with type awareness
         type_mismatches = self.compare_column_types(
@@ -295,6 +306,7 @@ class SchemaValidator:
             'extra_columns': sorted(extra_columns),
             'matching_columns': sorted(matching_columns),
             'match_percentage': round(match_percentage, 2),
+            'normalized_match_percentage': round(normalized_match_percentage, 2),
             'type_mismatches': type_mismatches,
         }
 
