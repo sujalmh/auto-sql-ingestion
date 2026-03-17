@@ -139,9 +139,10 @@ If no index: {{"index_column": null, "label_column": "States/UTs"}}"""
                 index_col = None
             label_col = result.get("label_column")
             if not label_col or label_col not in df.columns:
-                # Fallback: first string-like column
-                for c in df.columns:
-                    if df[c].dtype == object or str(df[c].dtype) == "object":
+                # Fallback: first string-like column.
+                # Use iloc to avoid DataFrame return when column names are duplicated.
+                for i, c in enumerate(df.columns):
+                    if df.iloc[:, i].dtype == object or str(df.iloc[:, i].dtype) == "object":
                         label_col = c
                         break
                 else:
@@ -149,8 +150,8 @@ If no index: {{"index_column": null, "label_column": "States/UTs"}}"""
             return (index_col, label_col)
         except Exception as e:
             logger.error(f"identify_structural_columns failed: {e}")
-            for c in df.columns:
-                if df[c].dtype == object or str(df[c].dtype) == "object":
+            for i, c in enumerate(df.columns):
+                if df.iloc[:, i].dtype == object or str(df.iloc[:, i].dtype) == "object":
                     return (None, c)
             return (None, columns[0] if columns else "")
 
@@ -260,7 +261,11 @@ For "data" rows do not include "level" or "label". For "group_header" include "l
         ]
         if not data_indices:
             return df.iloc[0:0].copy()
-        return df.loc[data_indices].reset_index(drop=True)
+        # Reset index first so .loc[] works even when the DataFrame carries a
+        # non-unique or non-integer index (e.g. after concat without reset).
+        df = df.reset_index(drop=True)
+        valid_indices = [i for i in data_indices if i < len(df)]
+        return df.loc[valid_indices].reset_index(drop=True)
 
     def standardize_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Strip whitespace, asterisks, footnote markers from string columns."""

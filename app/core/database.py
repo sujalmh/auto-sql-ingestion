@@ -212,6 +212,8 @@ class DatabaseManager:
 
                 # Convert all remaining values to numeric; invalid values become NULL.
                 numeric_vals = pd.to_numeric(normalized, errors='coerce')
+                # PostgreSQL NUMERIC cannot store infinity; replace inf/-inf with NULL.
+                numeric_vals = numeric_vals.replace([float('inf'), float('-inf')], pd.NA)
                 df[col] = numeric_vals.where(numeric_vals.notna(), other=None)
 
                 logger.info(f"Normalized numeric column '{col}' for DB insertion")
