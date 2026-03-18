@@ -207,6 +207,20 @@ class DatabaseManager:
 
                 # Work with strings only for token cleanup, preserving nulls.
                 normalized = series.where(series.isna(), series.astype(str).str.strip())
+                # Remove visual formatting that often appears in CSV exports.
+                # Example: "1,23,456", "12.5%", "₹ 34.2"
+                normalized = normalized.where(
+                    normalized.isna(),
+                    normalized.str.replace(r"[\r\n\t]+", " ", regex=True),
+                )
+                normalized = normalized.where(
+                    normalized.isna(),
+                    normalized.str.replace(r"[,%$]", "", regex=True),
+                )
+                normalized = normalized.where(
+                    normalized.isna(),
+                    normalized.str.replace(r"\u20b9", "", regex=True),
+                )
                 lowered = normalized.where(normalized.isna(), normalized.str.lower())
                 normalized = normalized.where(~lowered.isin(placeholder_tokens), None)
 
@@ -221,6 +235,46 @@ class DatabaseManager:
                 logger.warning(f"Could not normalize numeric column '{col}': {e}")
 
         return df
+
+    def _resolve_column_types_for_write(
+        self,
+        table_name: str,
+        df_columns: List[str],
+        incoming_column_types: Optional[Dict[str, str]],
+    ) -> Dict[str, str]:
+        """
+        Build an effective type map for write-time coercion.
+
+        Priority:
+          1) Existing DB schema type (authoritative for already-created tables)
+          2) Incoming inferred type from preprocessing
+
+        Returns a mapping keyed by *actual DataFrame column names* so downstream
+        normalizers can apply coercion without additional lookups.
+        """
+        effective: Dict[str, str] = {}
+        incoming_norm = {
+            str(k).strip().lower(): v
+            for k, v in (incoming_column_types or {}).items()
+        }
+        table_types = self.get_table_column_types(table_name)
+
+        for col in df_columns:
+            col_norm = str(col).strip().lower()
+            db_type = table_types.get(col_norm)
+            inferred_type = incoming_norm.get(col_norm)
+
+            if db_type:
+                if inferred_type and inferred_type.lower() != db_type.lower():
+                    logger.warning(
+                        f"Type drift during write for '{table_name}.{col}': "
+                        f"inferred={inferred_type}, db={db_type}. Using DB type for coercion."
+                    )
+                effective[col] = db_type
+            elif inferred_type:
+                effective[col] = inferred_type
+
+        return effective
 
     def _widen_narrow_varchars(self, table_name: str, df: pd.DataFrame, column_types: Dict[str, str]) -> None:
         """
@@ -386,10 +440,15 @@ class DatabaseManager:
         logger.info(f"Inserting {len(df)} rows into table '{table_name}'")
         
         try:
-            if column_types:
-                df = self._normalize_date_columns(df.copy(), column_types)
-                df = self._normalize_numeric_columns(df, column_types)
-                self._widen_narrow_varchars(table_name, df, column_types)
+            effective_column_types = self._resolve_column_types_for_write(
+                table_name=table_name,
+                df_columns=df.columns.tolist(),
+                incoming_column_types=column_types,
+            )
+            if effective_column_types:
+                df = self._normalize_date_columns(df.copy(), effective_column_types)
+                df = self._normalize_numeric_columns(df, effective_column_types)
+                self._widen_narrow_varchars(table_name, df, effective_column_types)
 
             # Prepare column names and data
             columns = df.columns.tolist()
@@ -790,10 +849,15 @@ class DatabaseManager:
         if df.empty:
             return 0, 0
 
-        if column_types:
-            df = self._normalize_date_columns(df.copy(), column_types)
-            df = self._normalize_numeric_columns(df, column_types)
-            self._widen_narrow_varchars(table_name, df, column_types)
+        effective_column_types = self._resolve_column_types_for_write(
+            table_name=table_name,
+            df_columns=df.columns.tolist(),
+            incoming_column_types=column_types,
+        )
+        if effective_column_types:
+            df = self._normalize_date_columns(df.copy(), effective_column_types)
+            df = self._normalize_numeric_columns(df, effective_column_types)
+            self._widen_narrow_varchars(table_name, df, effective_column_types)
 
         # Stamp ingested_at for every row
         df = df.copy()

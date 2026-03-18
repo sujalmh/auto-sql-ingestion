@@ -55,6 +55,7 @@ class JobData:
         self.rows_inserted: Optional[int] = None
         self.processed_file_path: Optional[str] = None
         self.warnings: list[str] = []
+        self.user_metadata: Optional[Dict] = None
         
         # Error tracking
         self.error: Optional[str] = None
@@ -368,6 +369,16 @@ class JobManager:
             return [
                 job for job in self._jobs.values()
                 if job.status in approvable
+            ]
+
+    def get_failed_jobs(self) -> List[JobData]:
+        """
+        Return all jobs that are currently in FAILED status.
+        """
+        with self._lock:
+            return [
+                job for job in self._jobs.values()
+                if job.status == JobStatus.FAILED
             ]
 
     def cleanup_expired_jobs(self) -> int:

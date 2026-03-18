@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, F
 from fastapi.responses import JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 import asyncio
 import re
 import urllib.parse
@@ -22,7 +22,8 @@ from app.models import (
     LLMMetadata,
     SimilarTableMatch,
     SchemaValidationResult,
-    IncrementalLoadPreview
+    IncrementalLoadPreview,
+    MetadataInput,
 )
 from app.core.logger import logger
 from app.core.job_manager import job_manager, JobStatus
@@ -585,8 +586,14 @@ async def approve_job(
     
     logger.info(f"Job {job_id} approved with table name: {final_table_name}")
     
-    # Update status to approved
-    job_manager.update_status(job_id, JobStatus.APPROVED)
+    metadata_payload = metadata.model_dump() if hasattr(metadata, "model_dump") else metadata.dict()
+    # Update status to approved and persist metadata so failed jobs can be retried.
+    job_manager.update_status(
+        job_id,
+        JobStatus.APPROVED,
+        user_metadata=metadata_payload,
+        table_name=final_table_name,
+    )
     
     # Route to OTL or IL based on job status
     if job.is_incremental_load and job.matched_table_name:
@@ -696,6 +703,200 @@ async def list_pending_jobs():
     return {"pending_jobs": results}
 
 
+def _metadata_from_job(job) -> Optional[MetadataInput]:
+    """
+    Rebuild MetadataInput from persisted job.user_metadata (if available).
+    """
+    payload = getattr(job, "user_metadata", None)
+    if not isinstance(payload, dict):
+        return None
+
+    required_fields = ("source", "source_url", "released_on", "updated_on")
+    missing = [field for field in required_fields if not payload.get(field)]
+    if missing:
+        logger.warning(f"[Job {job.job_id}] Cannot rebuild metadata; missing fields: {missing}")
+        return None
+
+    try:
+        return MetadataInput(
+            source=payload["source"],
+            source_url=payload["source_url"],
+            released_on=payload["released_on"],
+            updated_on=payload["updated_on"],
+            business_metadata=payload.get("business_metadata"),
+        )
+    except Exception as exc:
+        logger.warning(f"[Job {job.job_id}] Invalid stored metadata for retry: {exc}")
+        return None
+
+
+def _queue_retry_for_failed_job(job, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    """
+    Queue a retry for a FAILED job.
+
+    Returns:
+        {"queued": bool, "reason": str, "load_type": str, "table_name": str}
+    """
+    if job.status != JobStatus.FAILED:
+        return {
+            "queued": False,
+            "reason": f"Job status is '{job.status.value}', not failed",
+            "load_type": "unknown",
+            "table_name": "",
+        }
+
+    if job.processed_df is None:
+        return {
+            "queued": False,
+            "reason": "Missing processed DataFrame in memory",
+            "load_type": "unknown",
+            "table_name": "",
+        }
+
+    is_incremental = bool(job.is_incremental_load or job.matched_table_name)
+    load_type = "incremental" if is_incremental else "one_time"
+    table_name = (
+        job.matched_table_name
+        or job.table_name
+        or job.final_table_name
+        or job.proposed_table_name
+        or ""
+    ).lower()
+
+    if not table_name:
+        return {
+            "queued": False,
+            "reason": "Could not resolve target table name",
+            "load_type": load_type,
+            "table_name": "",
+        }
+
+    metadata_payload = getattr(job, "user_metadata", None)
+    metadata_obj = _metadata_from_job(job)
+
+    # For OTL retries, metadata is required to write business/operational metadata.
+    if not is_incremental and metadata_obj is None:
+        return {
+            "queued": False,
+            "reason": "Missing stored approval metadata for one-time-load retry",
+            "load_type": load_type,
+            "table_name": table_name,
+        }
+
+    # Clear stale error and re-queue.
+    job.error = None
+    job_manager.update_status(
+        job.job_id,
+        JobStatus.APPROVED,
+        user_metadata=metadata_payload if isinstance(metadata_payload, dict) else None,
+        table_name=table_name,
+    )
+
+    if is_incremental:
+        background_tasks.add_task(
+            perform_incremental_load,
+            job.job_id,
+            table_name,
+            metadata_payload,
+        )
+    else:
+        background_tasks.add_task(
+            insert_to_database,
+            job.job_id,
+            table_name,
+            metadata_obj,
+        )
+
+    logger.info(
+        f"[Job {job.job_id}] Queued retry for failed job "
+        f"(type={load_type}, table={table_name})"
+    )
+    return {
+        "queued": True,
+        "reason": "",
+        "load_type": load_type,
+        "table_name": table_name,
+    }
+
+
+@app.get("/failed-jobs")
+async def list_failed_jobs():
+    """
+    List all failed jobs currently present in in-memory job state.
+    """
+    failed = job_manager.get_failed_jobs()
+    results = []
+    for job in failed:
+        load_type = "incremental" if (job.is_incremental_load or job.matched_table_name) else "one_time"
+        results.append({
+            "job_id": job.job_id,
+            "status": job.status.value,
+            "load_type": load_type,
+            "table_name": job.matched_table_name or job.table_name or job.final_table_name or job.proposed_table_name,
+            "error": job.error,
+            "updated_at": job.updated_at.isoformat(),
+        })
+    return {"failed_jobs": results}
+
+
+@app.post("/retry/{job_id}")
+async def retry_failed_job(job_id: str, background_tasks: BackgroundTasks):
+    """
+    Retry a single failed job without re-uploading the original file.
+    """
+    job = job_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    retry_result = _queue_retry_for_failed_job(job, background_tasks)
+    if not retry_result["queued"]:
+        raise HTTPException(status_code=400, detail=retry_result["reason"])
+
+    return {
+        "message": "Retry queued",
+        "job_id": job_id,
+        "table_name": retry_result["table_name"],
+        "load_type": retry_result["load_type"],
+        "status": "approved",
+    }
+
+
+@app.post("/retry-failed")
+async def retry_all_failed_jobs(background_tasks: BackgroundTasks):
+    """
+    Retry all jobs currently in FAILED state.
+    """
+    failed = job_manager.get_failed_jobs()
+    if not failed:
+        return {
+            "message": "No failed jobs to retry.",
+            "retried": [],
+            "skipped": [],
+        }
+
+    retried = []
+    skipped = []
+    for job in failed:
+        retry_result = _queue_retry_for_failed_job(job, background_tasks)
+        if retry_result["queued"]:
+            retried.append({
+                "job_id": job.job_id,
+                "table_name": retry_result["table_name"],
+                "load_type": retry_result["load_type"],
+            })
+        else:
+            skipped.append({
+                "job_id": job.job_id,
+                "reason": retry_result["reason"],
+            })
+
+    return {
+        "message": f"Queued retries for {len(retried)} failed job(s).",
+        "retried": retried,
+        "skipped": skipped,
+    }
+
+
 @app.post("/batch-approve")
 async def batch_approve(
     background_tasks: BackgroundTasks,
@@ -712,7 +913,6 @@ async def batch_approve(
     is currently in an approvable status.
     """
     from dateutil import parser as date_parser
-    from app.models import MetadataInput
 
     try:
         released_on_parsed = date_parser.parse(released_on).isoformat()
@@ -727,6 +927,7 @@ async def batch_approve(
         updated_on=updated_on_parsed,
         business_metadata=business_metadata,
     )
+    metadata_payload = metadata.model_dump() if hasattr(metadata, "model_dump") else metadata.dict()
 
     pending = job_manager.get_pending_jobs()
     if not pending:
@@ -764,7 +965,12 @@ async def batch_approve(
 
         final_table_name = job.matched_table_name if is_il else (job.proposed_table_name or "").lower()
         job.table_name = final_table_name
-        job_manager.update_status(job_id, JobStatus.APPROVED)
+        job_manager.update_status(
+            job_id,
+            JobStatus.APPROVED,
+            user_metadata=metadata_payload,
+            table_name=final_table_name,
+        )
 
         if is_il:
             background_tasks.add_task(
