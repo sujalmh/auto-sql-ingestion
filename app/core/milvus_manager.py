@@ -193,7 +193,7 @@ class MilvusManager:
                 return False
             
             # Prepare data
-            signature_json = json.dumps(signature)
+            signature_json = json.dumps(signature, default=str)
             created_at = datetime.now().isoformat()
             
             # Insert data
