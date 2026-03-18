@@ -195,12 +195,6 @@ async def get_status(job_id: str):
         logger.warning(f"Job not found: {job_id}")
         raise HTTPException(status_code=404, detail="Job not found")
     
-    # Check if job has expired
-    if job_manager.is_expired(job_id):
-        logger.warning(f"Job {job_id} has expired")
-        job_manager.update_status(job_id, JobStatus.FAILED)
-        job_manager.set_error(job_id, "Job expired - approval timeout exceeded")
-    
     # Build response based on status
     response = StatusResponse(
         job_id=job.job_id,
@@ -249,8 +243,8 @@ async def get_status(job_id: str):
             llm_metadata=llm_metadata_obj
         )
     
-    # Add incremental load preview if schema mismatch
-    elif job.status == JobStatus.SCHEMA_MISMATCH and job.schema_validation is not None:
+    # Add incremental load preview if schema mismatch or duplicate data detected
+    elif job.status in (JobStatus.SCHEMA_MISMATCH, JobStatus.DUPLICATE_DATA_DETECTED) and job.schema_validation is not None:
         # Build similar table match info
         matched_table = job.matched_table_name
         similarity_score = job.similar_tables[0]['similarity_score'] if job.similar_tables else 0.0
