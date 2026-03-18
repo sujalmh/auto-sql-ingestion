@@ -1673,24 +1673,23 @@ async def _preprocess_phase_b(
             # No Milvus match — try column-based fallback (IDF-weighted overlap)
             logger.info(f"[Job {job_id}] No Milvus match. Trying column-based fallback.")
             new_columns = processed_df.columns.tolist()
-            fallback_result = schema_validator.find_similar_table_by_columns(
+            fallback_candidates = schema_validator.find_similar_table_by_columns(
                 new_columns=new_columns,
                 min_overlap=settings.column_fallback_min_overlap,
             )
 
-            if fallback_result:
-                matched_table_name, overlap_score = fallback_result
+            # Iterate through top-K candidates until one survives all guards
+            for _fb_idx, (fb_table_name, fb_overlap_score) in enumerate(fallback_candidates):
                 logger.info(
-                    f"[Job {job_id}] Column fallback matched: {matched_table_name} "
-                    f"(IDF-weighted overlap: {overlap_score:.2%})"
+                    f"[Job {job_id}] Column fallback candidate #{_fb_idx + 1}: {fb_table_name} "
+                    f"(IDF-weighted overlap: {fb_overlap_score:.2%})"
                 )
 
-                # Build a synthetic similar_tables entry so the rest of the
-                # pipeline can reuse the same validation code path
-                similarity_score = overlap_score
+                matched_table_name = fb_table_name
+                similarity_score = fb_overlap_score
                 similar_tables = [{
-                    'table_name': matched_table_name,
-                    'similarity_score': overlap_score,
+                    'table_name': fb_table_name,
+                    'similarity_score': fb_overlap_score,
                     'created_at': '',
                     'match_source': 'column_fallback',
                 }]
@@ -1698,11 +1697,11 @@ async def _preprocess_phase_b(
                 # -- Run the same validation pipeline as the Milvus path --
 
                 # Fetch existing table column types for type-drift detection
-                existing_db_types = db_manager.get_table_column_types(matched_table_name)
+                existing_db_types = db_manager.get_table_column_types(fb_table_name)
                 new_types_lower = {k.lower(): v for k, v in column_types.items()}
 
                 is_compatible, validation_result, report = schema_validator.validate_incremental_load(
-                    table_name=matched_table_name,
+                    table_name=fb_table_name,
                     new_columns=new_columns,
                     new_file_name=Path(file_path).name,
                     new_types=new_types_lower,
@@ -1711,106 +1710,109 @@ async def _preprocess_phase_b(
                 is_additive_evolution = validation_result.get('is_additive_evolution', False)
 
                 # Guard: reject if column overlap is too low
-                # match_percentage now includes LLM-reconciled column pairs
                 match_pct = validation_result.get('match_percentage', 0.0)
                 if match_pct < settings.schema_match_min_percentage:
                     logger.warning(
                         f"[Job {job_id}] Column fallback schema overlap too low "
                         f"({match_pct:.1f}% < {settings.schema_match_min_percentage}%) "
-                        f"for '{matched_table_name}' — treating as OTL"
+                        f"for '{fb_table_name}' — trying next candidate"
                     )
                     similar_tables = []
+                    continue
 
                 # LLM semantic verification
-                if similar_tables:
-                    logger.info(
-                        f"[Job {job_id}] Running LLM semantic verification "
-                        f"for column-fallback match '{matched_table_name}'"
+                logger.info(
+                    f"[Job {job_id}] Running LLM semantic verification "
+                    f"for column-fallback match '{fb_table_name}'"
+                )
+                matched_metadata = schema_validator.fetch_table_metadata(fb_table_name) or {}
+                semantic_result = schema_validator.verify_semantic_match(
+                    matched_table_name=fb_table_name,
+                    matched_table_metadata=matched_metadata,
+                    new_table_name=table_name,
+                    new_columns=new_columns,
+                    new_llm_metadata=llm_metadata,
+                    similarity_score=similarity_score,
+                )
+                logger.info(
+                    f"[Job {job_id}] Semantic verification: "
+                    f"is_related={semantic_result['is_related']}, "
+                    f"confidence={semantic_result['confidence']:.2f}, "
+                    f"reasoning='{semantic_result['reasoning']}'"
+                )
+                if not semantic_result['is_related']:
+                    logger.warning(
+                        f"[Job {job_id}] LLM rejected column-fallback match "
+                        f"'{fb_table_name}' — trying next candidate"
                     )
-                    matched_metadata = schema_validator.fetch_table_metadata(matched_table_name) or {}
-                    semantic_result = schema_validator.verify_semantic_match(
-                        matched_table_name=matched_table_name,
-                        matched_table_metadata=matched_metadata,
-                        new_table_name=table_name,
-                        new_columns=new_columns,
-                        new_llm_metadata=llm_metadata,
-                        similarity_score=similarity_score,
-                    )
-                    logger.info(
-                        f"[Job {job_id}] Semantic verification: "
-                        f"is_related={semantic_result['is_related']}, "
-                        f"confidence={semantic_result['confidence']:.2f}, "
-                        f"reasoning='{semantic_result['reasoning']}'"
-                    )
-                    if not semantic_result['is_related']:
-                        logger.warning(
-                            f"[Job {job_id}] LLM rejected column-fallback match "
-                            f"'{matched_table_name}' — treating as OTL"
-                        )
-                        similar_tables = []
+                    similar_tables = []
+                    continue
 
-                # If the fallback match survived all guards, route to IL
-                if similar_tables:
-                    logger.info(
-                        f"[Job {job_id}] Column fallback validated. "
-                        f"Schema: compatible={is_compatible}, "
-                        f"additive_evolution={is_additive_evolution}"
+                # This candidate survived all guards — accept it
+                break
+
+            # If a fallback match survived all guards, route to IL
+            if similar_tables:
+                logger.info(
+                    f"[Job {job_id}] Column fallback validated. "
+                    f"Schema: compatible={is_compatible}, "
+                    f"additive_evolution={is_additive_evolution}"
+                )
+                logger.info(f"[Job {job_id}] Validation report:\n{report}")
+
+                job_manager.set_similarity_results(
+                    job_id=job_id,
+                    similar_tables=similar_tables,
+                    matched_table_name=matched_table_name
+                )
+                job_manager.set_schema_validation(
+                    job_id=job_id,
+                    schema_validation=validation_result,
+                    is_incremental_load=True
+                )
+
+                # Duplicate detection
+                logger.info(f"[Job {job_id}] Checking for duplicate data")
+                duplicate_result = schema_validator.detect_duplicate_data(
+                    table_name=matched_table_name,
+                    new_df=processed_df
+                )
+                logger.info(f"[Job {job_id}] Duplicate detection: {duplicate_result['status']}")
+                logger.info(f"[Job {job_id}] {duplicate_result['message']}")
+
+                job = job_manager.get_job(job_id)
+                if job:
+                    job.duplicate_detection = duplicate_result
+
+                has_schema_changes = not is_compatible
+                is_full_duplicate = duplicate_result['status'] == 'DUPLICATE'
+
+                if is_full_duplicate and not has_schema_changes:
+                    job_manager.update_status(job_id, JobStatus.DUPLICATE_DATA_DETECTED)
+                    logger.warning(
+                        f"[Job {job_id}] Exact duplicate detected via column fallback. "
+                        "Awaiting user decision."
                     )
-                    logger.info(f"[Job {job_id}] Validation report:\n{report}")
-
-                    job_manager.set_similarity_results(
-                        job_id=job_id,
-                        similar_tables=similar_tables,
-                        matched_table_name=matched_table_name
-                    )
-                    job_manager.set_schema_validation(
-                        job_id=job_id,
-                        schema_validation=validation_result,
-                        is_incremental_load=True
-                    )
-
-                    # Duplicate detection
-                    logger.info(f"[Job {job_id}] Checking for duplicate data")
-                    duplicate_result = schema_validator.detect_duplicate_data(
-                        table_name=matched_table_name,
-                        new_df=processed_df
-                    )
-                    logger.info(f"[Job {job_id}] Duplicate detection: {duplicate_result['status']}")
-                    logger.info(f"[Job {job_id}] {duplicate_result['message']}")
-
-                    job = job_manager.get_job(job_id)
-                    if job:
-                        job.duplicate_detection = duplicate_result
-
-                    has_schema_changes = not is_compatible
-                    is_full_duplicate = duplicate_result['status'] == 'DUPLICATE'
-
-                    if is_full_duplicate and not has_schema_changes:
-                        job_manager.update_status(job_id, JobStatus.DUPLICATE_DATA_DETECTED)
-                        logger.warning(
-                            f"[Job {job_id}] Exact duplicate detected via column fallback. "
-                            "Awaiting user decision."
-                        )
-                    else:
-                        job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
-                        parts = []
-                        if duplicate_result['status'] in ['DUPLICATE', 'PARTIAL_OVERLAP']:
-                            parts.append("duplicate/overlap detected (UPSERT will handle)")
-                        if is_compatible:
-                            parts.append("exact schema match")
-                        elif is_additive_evolution:
-                            parts.append("additive schema evolution — new columns will be added automatically")
-                        else:
-                            parts.append("schema differences require review")
-                        logger.info(
-                            f"[Job {job_id}] Incremental load queued (column fallback): "
-                            f"{'; '.join(parts)}."
-                        )
                 else:
+                    job_manager.update_status(job_id, JobStatus.SCHEMA_MISMATCH)
+                    parts = []
+                    if duplicate_result['status'] in ['DUPLICATE', 'PARTIAL_OVERLAP']:
+                        parts.append("duplicate/overlap detected (UPSERT will handle)")
+                    if is_compatible:
+                        parts.append("exact schema match")
+                    elif is_additive_evolution:
+                        parts.append("additive schema evolution — new columns will be added automatically")
+                    else:
+                        parts.append("schema differences require review")
                     logger.info(
-                        f"[Job {job_id}] Column fallback match rejected by guards. "
-                        "Trying peer-job matching."
+                        f"[Job {job_id}] Incremental load queued (column fallback): "
+                        f"{'; '.join(parts)}."
                     )
+            else:
+                logger.info(
+                    f"[Job {job_id}] All column fallback candidates rejected by guards. "
+                    "Trying peer-job matching."
+                )
 
             # -- Peer-job matching (batch detection) --
             # If we still have no match, check other preprocessed jobs in memory

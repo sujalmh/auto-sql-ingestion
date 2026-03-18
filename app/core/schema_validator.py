@@ -106,10 +106,11 @@ class SchemaValidator:
         self,
         new_columns: List[str],
         min_overlap: float = 0.7,
-    ) -> Optional[Tuple[str, float]]:
+        top_k: int = 5,
+    ) -> List[Tuple[str, float]]:
         """
-        Fallback when Milvus is unavailable or returns no results: find an existing
-        table whose columns overlap with new_columns using IDF-weighted scoring.
+        Fallback when Milvus is unavailable or returns no results: find existing
+        tables whose columns overlap with new_columns using IDF-weighted scoring.
 
         IDF weighting ensures that columns appearing in many tables (e.g. generic
         format columns like 'element', 'year', 'value') contribute less to the
@@ -119,9 +120,10 @@ class SchemaValidator:
         Args:
             new_columns: Column names from the incoming file.
             min_overlap: Minimum IDF-weighted overlap score (0-1) to accept a match.
+            top_k: Maximum number of candidates to return.
 
         Returns:
-            (table_name, weighted_score) or None.
+            List of (table_name, weighted_score) sorted descending, or [].
         """
         tables = db_manager.list_tables_from_metadata()
         if not tables:
@@ -161,7 +163,7 @@ class SchemaValidator:
         # Using symmetric Dice coefficient prevents tables with very few
         # columns from falsely scoring 100% just because their tiny column
         # set happens to be a subset of the new file.
-        best_table, best_score = None, 0.0
+        candidates: List[Tuple[str, float]] = []
         for table_name, existing_norm in all_table_columns.items():
             if not existing_norm:
                 continue
@@ -188,18 +190,21 @@ class SchemaValidator:
                 f"weighted_score={weighted_score:.3f}"
             )
 
-            if weighted_score >= min_overlap and weighted_score > best_score:
-                best_score = weighted_score
-                best_table = table_name
+            if weighted_score >= min_overlap:
+                candidates.append((table_name, weighted_score))
 
-        if best_table is not None:
+        # Sort descending by score and keep top-K
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates = candidates[:top_k]
+
+        if candidates:
             logger.info(
-                f"Fallback match: {best_table} "
-                f"(IDF-weighted column overlap: {best_score:.2%})"
+                f"Fallback candidates ({len(candidates)}): "
+                + ", ".join(f"{t} ({s:.2%})" for t, s in candidates)
             )
         else:
             logger.info("No fallback match found above threshold")
-        return (best_table, best_score) if best_table else None
+        return candidates
 
     def compare_column_types(
         self,
