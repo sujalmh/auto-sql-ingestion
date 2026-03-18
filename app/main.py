@@ -257,7 +257,7 @@ async def get_status(job_id: str):
                 table_name=matched_table,
                 similarity_score=similarity_score,
                 columns=matched_metadata['columns'],
-                row_count=matched_metadata['rows_count'],
+                row_count=int(matched_metadata['rows_count'] or 0),
                 created_at=job.similar_tables[0]['created_at'] if job.similar_tables else ""
             )
             
@@ -277,7 +277,7 @@ async def get_status(job_id: str):
             )
             
             # Get current row count
-            current_rows = incremental_loader.get_current_row_count(matched_table) or matched_metadata['rows_count']
+            current_rows = int(incremental_loader.get_current_row_count(matched_table) or matched_metadata['rows_count'] or 0)
             new_rows = len(job.processed_df) if job.processed_df is not None else 0
             
             response.incremental_load_preview = IncrementalLoadPreview(
@@ -297,7 +297,7 @@ async def get_status(job_id: str):
     elif job.status == JobStatus.COMPLETED:
         response.result = ProcessingResult(
             table_name=job.final_table_name,
-            rows_inserted=job.rows_inserted,
+            rows_inserted=int(job.rows_inserted or 0),
             columns=job.processed_df.columns.tolist() if job.processed_df is not None else [],
             processed_file_path=job.processed_file_path or "",
             warnings=job.warnings
