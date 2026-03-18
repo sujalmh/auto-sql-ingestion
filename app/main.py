@@ -94,6 +94,121 @@ async def clear_jobs():
     return {"message": "All jobs cleared", "cleared": n}
 
 
+@app.post("/admin/backfill-milvus")
+async def backfill_milvus(
+    background_tasks: BackgroundTasks,
+    tables: Optional[str] = Form(None),
+    dry_run: bool = Form(False),
+):
+    """
+    Backfill Milvus signatures for existing PostgreSQL tables.
+
+    Parameters:
+        tables: Comma-separated table names (default: all public tables).
+        dry_run: If true, only report what would be done.
+    """
+    from psycopg2 import sql as psql
+
+    # --- resolve target tables ---
+    excluded = {"tables_metadata", "operational_metadata"}
+    if tables:
+        target = [t.strip() for t in tables.split(",") if t.strip()]
+    else:
+        try:
+            with db_manager.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT table_name FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                        ORDER BY table_name
+                        """
+                    )
+                    target = [r[0] for r in cur.fetchall() if r[0].lower() not in excluded]
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to list tables: {exc}")
+
+    if not target:
+        return {"message": "No tables found", "created": 0, "failed": 0, "skipped": 0}
+
+    # --- connect to Milvus ---
+    if not milvus_manager.connect():
+        raise HTTPException(status_code=503, detail="Cannot connect to Milvus")
+    if not milvus_manager.create_collection():
+        raise HTTPException(status_code=503, detail="Cannot init Milvus collection")
+
+    # --- detect already-signed tables ---
+    missing = []
+    already_signed = 0
+    for tbl in target:
+        try:
+            escaped = tbl.replace('"', '\\"')
+            rows = milvus_manager.collection.query(
+                expr=f'table_name == "{escaped}"', output_fields=["table_name"], limit=1,
+            )
+            if rows:
+                already_signed += 1
+            else:
+                missing.append(tbl)
+        except Exception:
+            missing.append(tbl)
+
+    if dry_run:
+        return {
+            "message": "dry-run",
+            "total_tables": len(target),
+            "already_signed": already_signed,
+            "would_create": len(missing),
+            "tables": missing,
+        }
+
+    # --- backfill in background ---
+    async def _do_backfill(tables_to_fill: list):
+        created = 0
+        failed = 0
+        for tbl in tables_to_fill:
+            try:
+                query = psql.SQL("SELECT * FROM {} LIMIT %s").format(psql.Identifier(tbl))
+                with db_manager.get_connection() as conn:
+                    sample_df = pd.read_sql(query.as_string(conn), conn, params=[5])
+                count_q = psql.SQL("SELECT COUNT(*) FROM {}").format(psql.Identifier(tbl))
+                with db_manager.get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(count_q)
+                        row_count = int(cur.fetchone()[0])
+                col_types = db_manager.get_table_column_types(tbl)
+                for col in sample_df.columns:
+                    col_types.setdefault(col, "text")
+                sample_rows = sample_df.to_dict(orient="records")
+                sig = {
+                    "table_name": tbl,
+                    "columns": sample_df.columns.tolist(),
+                    "column_types": col_types,
+                    "sample_rows": sample_rows,
+                    "row_count": row_count,
+                }
+                emb = signature_builder.create_embedding(sig)
+                ok = milvus_manager.insert_signature(tbl, emb, sig)
+                if ok:
+                    created += 1
+                else:
+                    failed += 1
+                    logger.error(f"[backfill] insert failed for {tbl}")
+            except Exception as exc:
+                failed += 1
+                logger.error(f"[backfill] error for {tbl}: {exc}")
+        logger.info(f"[backfill] done — created={created}, failed={failed}, skipped={already_signed}")
+
+    background_tasks.add_task(_do_backfill, missing)
+
+    return {
+        "message": "Backfill started in background",
+        "total_tables": len(target),
+        "already_signed": already_signed,
+        "will_create": len(missing),
+    }
+
+
 @app.post("/upload", response_model=UploadResponse)
 async def upload_file(
     background_tasks: BackgroundTasks,

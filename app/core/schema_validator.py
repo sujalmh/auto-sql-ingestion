@@ -154,24 +154,33 @@ class SchemaValidator:
         idf_corpus["__new_file__"] = new_norm
         idf = self._compute_column_idf(idf_corpus)
 
-        # Second pass: compute IDF-weighted overlap for each table
+        # Pre-compute total IDF weight for the new file's columns (constant)
+        total_new_weight = sum(idf.get(c, 1.0) for c in new_norm)
+
+        # Second pass: compute IDF-weighted Dice overlap for each table.
+        # Using symmetric Dice coefficient prevents tables with very few
+        # columns from falsely scoring 100% just because their tiny column
+        # set happens to be a subset of the new file.
         best_table, best_score = None, 0.0
         for table_name, existing_norm in all_table_columns.items():
             if not existing_norm:
                 continue
 
             matched_cols = new_norm & existing_norm
-            if not matched_cols:
+            # Require a minimum number of matched columns to avoid
+            # degenerate matches against tables with 1-2 generic columns.
+            if len(matched_cols) < 3:
                 continue
 
-            # Weighted score: sum of IDF for matched cols / sum of IDF for existing cols
+            # Symmetric Dice score: 2 * matched / (existing + new)
             matched_weight = sum(idf.get(c, 1.0) for c in matched_cols)
-            total_weight = sum(idf.get(c, 1.0) for c in existing_norm)
+            total_existing_weight = sum(idf.get(c, 1.0) for c in existing_norm)
+            denominator = total_existing_weight + total_new_weight
 
-            if total_weight == 0:
+            if denominator == 0:
                 continue
 
-            weighted_score = matched_weight / total_weight
+            weighted_score = 2.0 * matched_weight / denominator
 
             logger.debug(
                 f"Column fallback: {table_name} — "

@@ -29,10 +29,10 @@ class Settings(BaseSettings):
     similarity_top_k: int = 5
     # Minimum column-overlap percentage to accept a Milvus match as incremental load
     schema_match_min_percentage: float = 60.0
-    # Column-based fallback: minimum IDF-weighted column overlap (0-1) when Milvus
-    # returns no match.  Higher than Milvus threshold because it lacks semantic
-    # context from embeddings.
-    column_fallback_min_overlap: float = 0.7
+    # Column-based fallback: minimum IDF-weighted Dice overlap (0-1) when Milvus
+    # returns no match.  Uses symmetric Dice coefficient so both the existing
+    # table's columns and the new file's columns must match well.
+    column_fallback_min_overlap: float = 0.55
     
     # OpenAI Embeddings
     embedding_model: str = "text-embedding-3-small"
