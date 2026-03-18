@@ -1,9 +1,11 @@
+import math
 import re
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import execute_batch, execute_values
+import numpy as np
 import pandas as pd
-from typing import Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 from contextlib import contextmanager
 from datetime import datetime
 from app.config import settings
@@ -35,6 +37,32 @@ _WIDENING_GROUPS: Dict[str, List[str]] = {
     # Boolean can widen to text
     "boolean": ["text"],
 }
+
+
+def _sql_safe_scalar(v: Any) -> Any:
+    """
+    Values safe for psycopg2: never pd.NA / NAType / NaN (float) — use SQL NULL.
+    """
+    if v is None:
+        return None
+    try:
+        if v is pd.NA:
+            return None
+    except Exception:
+        pass
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    try:
+        if isinstance(v, (np.floating, np.integer)) and pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        if type(v).__name__ == "NAType":
+            return None
+    except Exception:
+        pass
+    return v
 
 
 class DatabaseManager:
@@ -154,34 +182,59 @@ class DatabaseManager:
             logger.error(f"Error creating table '{table_name}': {str(e)}")
             return False
     
-    _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+    @staticmethod
+    def _pg_temporal_kind(col_type: str) -> Optional[str]:
+        """Return 'date', 'timestamp', or None for information_schema-style types."""
+        ct = (col_type or "").lower().strip()
+        if ct == "date":
+            return "date"
+        if "timestamp" in ct:
+            return "timestamp"
+        return None
 
     def _normalize_date_columns(self, df: pd.DataFrame, column_types: Dict[str, str]) -> pd.DataFrame:
         """
-        Parse ambiguous date strings (e.g. DD-MM-YY) into ISO 8601 (YYYY-MM-DD)
-        so PostgreSQL accepts them regardless of its datestyle setting.
+        Coerce date/timestamp columns to strings PostgreSQL accepts, or NULL.
+        Always runs for DB date/timestamp columns so float NaN / bad values never
+        reach the wire as double precision (which breaks TIMESTAMP columns).
         """
-        date_type_keywords = ('DATE', 'TIMESTAMP')
         for col, col_type in column_types.items():
             if col not in df.columns:
                 continue
-            if not any(kw in col_type.upper() for kw in date_type_keywords):
+            kind = self._pg_temporal_kind(col_type)
+            if not kind:
                 continue
             try:
-                non_null = df[col].dropna()
-                first_valid = str(non_null.astype(str).iloc[0]) if len(non_null) > 0 else ""
-                already_iso = bool(self._ISO_DATE_RE.match(str(first_valid)))
-                parsed = pd.to_datetime(
-                    df[col],
-                    dayfirst=not already_iso,
-                    errors='coerce',
-                )
-                non_null_ratio = parsed.notna().sum() / max(len(parsed), 1)
-                if non_null_ratio >= 0.5:
-                    df[col] = parsed.dt.strftime('%Y-%m-%d').where(parsed.notna(), other=None)
-                    logger.info(f"Normalized date column '{col}' to ISO format ({non_null_ratio:.0%} parsed)")
-                else:
-                    logger.warning(f"Column '{col}' typed as {col_type} but only {non_null_ratio:.0%} parsed as dates, leaving as-is")
+                series = df[col]
+                non_null_before = series.notna().sum()
+                parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
+                if non_null_before and parsed.notna().sum() < max(1, non_null_before // 2):
+                    parsed2 = pd.to_datetime(series, errors="coerce", dayfirst=False)
+                    if parsed2.notna().sum() > parsed.notna().sum():
+                        parsed = parsed2
+
+                def _fmt(ts: Any) -> Any:
+                    if ts is None or (isinstance(ts, float) and math.isnan(ts)):
+                        return None
+                    if pd.isna(ts):
+                        return None
+                    tt = pd.Timestamp(ts)
+                    if kind == "date":
+                        return tt.strftime("%Y-%m-%d")
+                    if tt.hour == 0 and tt.minute == 0 and tt.second == 0 and tt.microsecond == 0:
+                        return tt.strftime("%Y-%m-%d")
+                    return tt.strftime("%Y-%m-%d %H:%M:%S")
+
+                out_list = [_fmt(x) for x in parsed]
+                df[col] = out_list
+                n_ok = sum(1 for x in out_list if x is not None)
+                n = len(out_list)
+                if n_ok < n and n:
+                    logger.warning(
+                        f"Column '{col}' ({col_type}): {n - n_ok} value(s) unparseable as dates → NULL"
+                    )
+                if n_ok:
+                    logger.info(f"Normalized temporal column '{col}' for DB ({n_ok}/{n} non-null)")
             except Exception as e:
                 logger.warning(f"Could not normalize date column '{col}': {e}")
         return df
@@ -227,8 +280,13 @@ class DatabaseManager:
                 # Convert all remaining values to numeric; invalid values become NULL.
                 numeric_vals = pd.to_numeric(normalized, errors='coerce')
                 # PostgreSQL NUMERIC cannot store infinity; replace inf/-inf with NULL.
-                numeric_vals = numeric_vals.replace([float('inf'), float('-inf')], pd.NA)
-                df[col] = numeric_vals.where(numeric_vals.notna(), other=None)
+                numeric_vals = numeric_vals.replace([float('inf'), float('-inf')], np.nan)
+                # Use float NaN then None — psycopg2 cannot adapt pd.NA
+                df[col] = [
+                    None if (x is None or (isinstance(x, float) and math.isnan(x)) or pd.isna(x))
+                    else float(x)
+                    for x in numeric_vals
+                ]
 
                 logger.info(f"Normalized numeric column '{col}' for DB insertion")
             except Exception as e:
@@ -454,8 +512,11 @@ class DatabaseManager:
             columns = df.columns.tolist()
             safe_columns = [self._sanitize_identifier(col) for col in columns]
             
-            # Convert DataFrame to list of tuples
-            data = [tuple(row) for row in df.values]
+            # Convert DataFrame to list of tuples (no pd.NA / NaN for psycopg2)
+            data = [
+                tuple(_sql_safe_scalar(x) for x in row)
+                for row in df.values
+            ]
             
             # Build INSERT statement
             placeholders = ', '.join(['%s'] * len(columns))
@@ -892,7 +953,10 @@ class DatabaseManager:
             f"RETURNING (xmax = 0) AS inserted"
         )
 
-        rows_data = [tuple(row) for row in df.itertuples(index=False, name=None)]
+        rows_data = [
+            tuple(_sql_safe_scalar(x) for x in row)
+            for row in df.itertuples(index=False, name=None)
+        ]
 
         inserted_count = 0
         updated_count  = 0
@@ -971,7 +1035,10 @@ class DatabaseManager:
             f"INSERT INTO {safe_table} ({', '.join(safe_all)}) "
             f"VALUES %s ON CONFLICT ({conflict_target}) DO NOTHING"
         )
-        rows_data = [tuple(row) for row in df.itertuples(index=False, name=None)]
+        rows_data = [
+            tuple(_sql_safe_scalar(x) for x in row)
+            for row in df.itertuples(index=False, name=None)
+        ]
         inserted = 0
         try:
             with self.get_connection() as conn:
