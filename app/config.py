@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # returns no match.  Uses symmetric Dice coefficient so both the existing
     # table's columns and the new file's columns must match well.
     column_fallback_min_overlap: float = 0.55
+
+    # LLM semantic rejection override: when structural evidence is strong,
+    # allow overriding a low-confidence LLM rejection.
+    semantic_rejection_min_confidence: float = 0.85
+    structural_override_min_overlap: float = 85.0
+    table_name_override_min_similarity: float = 0.5
     
     # OpenAI Embeddings
     embedding_model: str = "text-embedding-3-small"

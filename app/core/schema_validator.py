@@ -102,6 +102,19 @@ class SchemaValidator:
             idf[col] = math.log(total_tables / df) + 1.0
         return idf
 
+    @staticmethod
+    def compute_table_name_similarity(name_a: str, name_b: str) -> float:
+        """Jaccard similarity on underscore-delimited tokens of two table names."""
+        tokens_a = set(name_a.lower().strip().split("_"))
+        tokens_b = set(name_b.lower().strip().split("_"))
+        tokens_a.discard("")
+        tokens_b.discard("")
+        if not tokens_a or not tokens_b:
+            return 0.0
+        intersection = tokens_a & tokens_b
+        union = tokens_a | tokens_b
+        return len(intersection) / len(union)
+
     def find_similar_table_by_columns(
         self,
         new_columns: List[str],
@@ -610,6 +623,7 @@ If no columns are semantically equivalent, return: {{"pairs": []}}"""
         new_columns: List[str],
         new_llm_metadata: Dict,
         similarity_score: float,
+        column_overlap_pct: float = 0.0,
     ) -> Dict:
         """
         Use an LLM call to verify whether the schema-matched existing table
@@ -626,6 +640,8 @@ If no columns are semantically equivalent, return: {{"pairs": []}}"""
             new_llm_metadata:       LLM-generated metadata for the new file
                                     (keys: 'data_domain', 'description', etc.).
             similarity_score:       Milvus cosine similarity score (0–1).
+            column_overlap_pct:     Schema match percentage from structural
+                                    validation (0–100).
 
         Returns:
             {
@@ -634,9 +650,12 @@ If no columns are semantically equivalent, return: {{"pairs": []}}"""
                 "reasoning": str      # LLM explanation
             }
         """
+        name_sim = self.compute_table_name_similarity(new_table_name, matched_table_name)
+
         logger.info(
             f"Running LLM semantic verification: "
-            f"'{new_table_name}' vs existing '{matched_table_name}'"
+            f"'{new_table_name}' vs existing '{matched_table_name}' "
+            f"(name_similarity={name_sim:.2f}, column_overlap={column_overlap_pct:.1f}%)"
         )
 
         # ---- build the prompt ------------------------------------------------
@@ -663,7 +682,11 @@ Proposed table name: {new_table_name}
 Domain              : {new_domain}
 Description         : {new_desc}
 Columns             : {json.dumps(new_columns[:30], default=str)}
-Milvus similarity   : {similarity_score:.4f}
+
+--- STRUCTURAL SIGNALS ---
+Milvus similarity       : {similarity_score:.4f}
+Column overlap           : {column_overlap_pct:.1f}%
+Table-name similarity    : {name_sim:.2f}  (Jaccard on name tokens)
 
 Answer with a JSON object:
 {{
@@ -678,7 +701,11 @@ Rules:
 - "is_related" = false means they are DIFFERENT datasets despite structural
   similarity; the new file should be stored as a separate table.
 - Consider table names, domains, descriptions, and column semantics.
-- A high Milvus score alone is NOT sufficient; the meaning must match."""
+- When column overlap is above 85% AND the table names share most tokens,
+  default to is_related=true unless you have very strong evidence they are
+  genuinely different datasets (different subject matter, not just a different
+  time-period or granularity of the same data).
+- Only set confidence above 0.90 when you are very certain in your judgment."""
 
         # ---- call the LLM ---------------------------------------------------
         try:
