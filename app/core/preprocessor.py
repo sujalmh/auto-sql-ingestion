@@ -854,12 +854,24 @@ class DataPreprocessor:
         value = str(value).strip()
         month_abbr = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+        def _fmt(m: int, y: str) -> str:
+            if 1 <= m <= 12:
+                return f"{month_abbr[m - 1]} {y}"
+            return value
+
         if re.match(r"^\d{1,2}-\d{4}$", value):
-            m, y = value.split("-")
-            return f"{month_abbr[int(m) - 1]} {y}"
+            m, y = value.split("-", 1)
+            try:
+                return _fmt(int(m), y)
+            except (ValueError, TypeError):
+                return value
         if re.match(r"^\d{4}-\d{1,2}$", value):
-            y, m = value.split("-")
-            return f"{month_abbr[int(m) - 1]} {y}"
+            y, m = value.split("-", 1)
+            try:
+                return _fmt(int(m), y)
+            except (ValueError, TypeError):
+                return value
         year_m = re.search(r"\b(20\d{2})\b", value)
         months_lower = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
                         "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
