@@ -27,6 +27,7 @@ from app.models import (
 )
 from app.core.logger import logger
 from app.core.job_manager import job_manager, JobStatus
+from app.core.column_utils import normalize_column_for_similarity
 from app.core.llm_architect import llm_architect
 from app.core.preprocessor import preprocessor
 from app.core.database import db_manager
@@ -680,9 +681,15 @@ async def list_pending_jobs():
     """
     List all jobs that are awaiting approval (OTL, IL schema-mismatch,
     or duplicate-data-detected).  Returns a lightweight summary per job
-    suitable for the batch-approve UI.
+    suitable for the batch-approve UI, including auto-detected table
+    groups so the caller can see which files will share a table.
     """
     pending = job_manager.get_pending_jobs()
+
+    groups = _compute_table_groups(
+        pending, settings.batch_regroup_min_overlap,
+    )
+
     results = []
     for job in pending:
         load_type = "IL" if (job.is_incremental_load and job.matched_table_name) else "OTL"
@@ -690,6 +697,9 @@ async def list_pending_jobs():
         total_rows = len(job.processed_df) if job.processed_df is not None else 0
         columns_count = len(job.processed_df.columns) if job.processed_df is not None else 0
         filename = Path(job.file_path).name if job.file_path else ""
+
+        grp = groups.get(job.job_id, {})
+
         results.append({
             "job_id": job.job_id,
             "filename": filename,
@@ -699,6 +709,8 @@ async def list_pending_jobs():
             "total_rows": total_rows,
             "columns_count": columns_count,
             "created_at": job.created_at.isoformat(),
+            "table_group": grp.get("table_name", table_name),
+            "group_role": grp.get("role", "anchor"),
         })
     return {"pending_jobs": results}
 
@@ -897,6 +909,117 @@ async def retry_all_failed_jobs(background_tasks: BackgroundTasks):
     }
 
 
+def _compute_table_groups(
+    pending_jobs,
+    min_overlap: float,
+):
+    """Cluster pending OTL jobs by normalised column overlap.
+
+    Returns a dict mapping each job_id to a dict with:
+        ``anchor_job_id`` – the earliest job in the group (OTL),
+        ``table_name``    – the proposed table name for the group,
+        ``role``          – ``"anchor"`` or ``"member"``.
+    Jobs that are already IL are included as-is (role="il_existing").
+    """
+    groups: dict[str, dict] = {}
+
+    otl_jobs = [
+        j for j in pending_jobs
+        if not j.is_incremental_load and j.processed_df is not None
+    ]
+    otl_jobs.sort(key=lambda j: j.created_at)
+
+    norm_cols_cache: dict[str, set[str]] = {}
+    for j in otl_jobs:
+        norm_cols_cache[j.job_id] = {
+            normalize_column_for_similarity(c)
+            for c in j.processed_df.columns.tolist()
+        }
+
+    assigned: set[str] = set()
+
+    for job in otl_jobs:
+        jid = job.job_id
+        if jid in assigned:
+            continue
+
+        anchor_table = job.proposed_table_name or ""
+        groups[jid] = {
+            "anchor_job_id": jid,
+            "table_name": anchor_table,
+            "role": "anchor",
+        }
+        assigned.add(jid)
+        cols_a = norm_cols_cache[jid]
+        if not cols_a:
+            continue
+
+        for other in otl_jobs:
+            oid = other.job_id
+            if oid in assigned:
+                continue
+            cols_b = norm_cols_cache[oid]
+            if not cols_b:
+                continue
+            union_size = len(cols_a | cols_b)
+            if union_size == 0:
+                continue
+            overlap = len(cols_a & cols_b) / union_size
+            if overlap >= min_overlap:
+                groups[oid] = {
+                    "anchor_job_id": jid,
+                    "table_name": anchor_table,
+                    "role": "member",
+                }
+                assigned.add(oid)
+
+    for job in pending_jobs:
+        if job.job_id not in groups:
+            if job.is_incremental_load and job.matched_table_name:
+                groups[job.job_id] = {
+                    "anchor_job_id": job.peer_anchor_job_id or "",
+                    "table_name": job.matched_table_name,
+                    "role": "il_existing",
+                }
+            else:
+                groups[job.job_id] = {
+                    "anchor_job_id": job.job_id,
+                    "table_name": job.proposed_table_name or "",
+                    "role": "anchor",
+                }
+
+    return groups
+
+
+def _regroup_pending_otl_jobs(min_overlap: float) -> dict:
+    """Mutate pending OTL jobs so schema-similar files share a table.
+
+    Converts later OTL jobs into IL pointing at the earliest anchor.
+    Returns the groups dict (same shape as ``_compute_table_groups``).
+    """
+    pending = job_manager.get_pending_jobs()
+    groups = _compute_table_groups(pending, min_overlap)
+
+    for job in pending:
+        info = groups.get(job.job_id)
+        if not info or info["role"] != "member":
+            continue
+        anchor_jid = info["anchor_job_id"]
+        anchor_table = info["table_name"]
+
+        logger.info(
+            f"[Regroup] Converting OTL job {job.job_id[:8]}... "
+            f"('{Path(job.file_path).name if job.file_path else '?'}') "
+            f"to IL targeting '{anchor_table}' "
+            f"(anchor job {anchor_jid[:8]}...)"
+        )
+        job.is_incremental_load = True
+        job.matched_table_name = anchor_table
+        job.peer_anchor_job_id = anchor_jid
+
+    return groups
+
+
 @app.post("/batch-approve")
 async def batch_approve(
     background_tasks: BackgroundTasks,
@@ -928,6 +1051,18 @@ async def batch_approve(
         business_metadata=business_metadata,
     )
     metadata_payload = metadata.model_dump() if hasattr(metadata, "model_dump") else metadata.dict()
+
+    regroup_result = _regroup_pending_otl_jobs(
+        min_overlap=settings.batch_regroup_min_overlap,
+    )
+    regrouped_count = sum(
+        1 for v in regroup_result.values() if v["role"] == "member"
+    )
+    if regrouped_count:
+        logger.info(
+            f"[batch-approve] Auto-regrouped {regrouped_count} OTL job(s) "
+            "into IL based on schema similarity"
+        )
 
     pending = job_manager.get_pending_jobs()
     if not pending:

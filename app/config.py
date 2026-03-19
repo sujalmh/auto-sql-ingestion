@@ -39,6 +39,17 @@ class Settings(BaseSettings):
     semantic_rejection_min_confidence: float = 0.85
     structural_override_min_overlap: float = 85.0
     table_name_override_min_similarity: float = 0.5
+
+    # Peer-job auto-accept: skip LLM semantic verification when the
+    # IDF-weighted column overlap with a peer job is at or above this
+    # threshold (0-1).  Prevents LLM from rejecting structurally identical
+    # files in the same batch (e.g. different survey rounds / sector variants).
+    peer_auto_accept_min_overlap: float = 0.90
+
+    # Batch-approve auto-regrouping: at batch-approve time, pending OTL jobs
+    # whose normalised column overlap meets this threshold are automatically
+    # grouped so only the earliest becomes OTL and the rest become IL.
+    batch_regroup_min_overlap: float = 0.90
     
     # OpenAI Embeddings
     embedding_model: str = "text-embedding-3-small"

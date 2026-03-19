@@ -293,7 +293,14 @@ class ILClassifier:
         )
 
         peer_overlap_pct = peer_score * 100.0
-        if not self._verify_with_llm(
+
+        if peer_score >= self._cfg.peer_auto_accept_min_overlap:
+            logger.info(
+                f"[Job {job_id}] Peer-job column overlap {peer_score:.2%} "
+                f">= {self._cfg.peer_auto_accept_min_overlap:.0%} threshold "
+                "— auto-accepting without LLM verification"
+            )
+        elif not self._verify_with_llm(
             candidate, table_name, new_columns,
             llm_metadata, peer_overlap_pct, job_id,
         ):
