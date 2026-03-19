@@ -207,9 +207,12 @@ class DatabaseManager:
             try:
                 series = df[col]
                 non_null_before = series.notna().sum()
-                parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
+                # Use dayfirst=False when data looks like ISO (YYYY-MM-DD) to avoid pandas warning
+                first_val = str(series.dropna().iloc[0]) if non_null_before else ""
+                dayfirst = not bool(re.match(r"^\d{4}-\d{2}-\d{2}", first_val))
+                parsed = pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
                 if non_null_before and parsed.notna().sum() < max(1, non_null_before // 2):
-                    parsed2 = pd.to_datetime(series, errors="coerce", dayfirst=False)
+                    parsed2 = pd.to_datetime(series, errors="coerce", dayfirst=not dayfirst)
                     if parsed2.notna().sum() > parsed.notna().sum():
                         parsed = parsed2
 
@@ -336,10 +339,10 @@ class DatabaseManager:
 
     def _widen_narrow_varchars(self, table_name: str, df: pd.DataFrame, column_types: Dict[str, str]) -> None:
         """
-        Before insertion, check every VARCHAR(n) column: if the data contains values
-        longer than n, ALTER the column to TEXT so the INSERT won't fail.
+        Before insertion, check every VARCHAR(n) / character varying(n) column: if the
+        data contains values longer than n, ALTER the column to TEXT so the INSERT won't fail.
         """
-        varchar_re = re.compile(r"VARCHAR\((\d+)\)", re.IGNORECASE)
+        varchar_re = re.compile(r"(?:character\s+varying|varchar)\((\d+)\)", re.IGNORECASE)
         alterations: List[str] = []
         for col, col_type in column_types.items():
             m = varchar_re.search(col_type)
@@ -780,6 +783,8 @@ class DatabaseManager:
         """
         Return a mapping of {column_name_lowercase: postgres_data_type} for
         every column in the table.  Uses information_schema for portability.
+        For character varying, appends (n) when character_maximum_length is set
+        so that _widen_narrow_varchars can detect and widen VARCHAR(1) etc.
         Returns an empty dict if the table does not exist or on error.
         """
         try:
@@ -787,7 +792,7 @@ class DatabaseManager:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT column_name, data_type
+                        SELECT column_name, data_type, character_maximum_length
                         FROM information_schema.columns
                         WHERE table_schema = 'public'
                           AND table_name   = %s
@@ -795,7 +800,14 @@ class DatabaseManager:
                         """,
                         (table_name.lower(),)
                     )
-                    result = {row[0].lower(): row[1].lower() for row in cur.fetchall()}
+                    result = {}
+                    for row in cur.fetchall():
+                        col_name = row[0].lower()
+                        dtype = (row[1] or "").lower()
+                        max_len = row[2]
+                        if dtype in ("character varying", "varchar") and max_len is not None:
+                            dtype = f"character varying({int(max_len)})"
+                        result[col_name] = dtype
                     logger.info(f"Fetched {len(result)} column types for '{table_name}'")
                     return result
         except Exception as e:
